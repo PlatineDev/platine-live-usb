@@ -140,7 +140,7 @@ start() {
     # Install required tools
     apk add --no-cache \
         dmidecode smartmontools pciutils usbutils \
-        lm-sensors hdparm curl wpa_supplicant 2>/dev/null
+        lm-sensors hdparm curl wpa_supplicant bash 2>/dev/null
 
     # Load Realtek WiFi driver
     modprobe rtw_8723de 2>/dev/null || true
