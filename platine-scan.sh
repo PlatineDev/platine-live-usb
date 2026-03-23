@@ -1432,30 +1432,6 @@ if cmd jq; then
     jq empty "$OUTFILE" 2>/dev/null && log_ok "JSON valid ✓" || log_warn "JSON may have issues"
 fi
 
-# ── Auto-fix JSON if invalid ──────────────────────────────────
-if cmd python3; then
-    python3 -c "
-import json, re, sys
-try:
-    with open('$OUTFILE') as f:
-        content = f.read()
-    json.loads(content)
-except json.JSONDecodeError:
-    # Fix: number followed by newline and null without comma
-    content = re.sub(r'(\d+)\s*\nnull', r'\1', content)
-    # Fix: any value followed by newline without comma before next key
-    content = re.sub(r'(\d+)\s*\n\s*(null|true|false|\")', r'\1,\2', content)
-    with open('$OUTFILE', 'w') as f:
-        f.write(content)
-    # Verify fix worked
-    try:
-        json.loads(content)
-        print('JSON auto-fixed successfully')
-    except:
-        print('JSON still has issues after fix')
-" 2>/dev/null || true
-fi
-
 # ── Send to platine.dev ───────────────────────────────────────
 PLATINE_API="https://platine.dev/api/live/start"
 LIVE_LINK=""
