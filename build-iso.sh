@@ -16,7 +16,7 @@
 
 set -e
 
-PLATINE_VERSION="1.0.0"
+PLATINE_VERSION="2.0.0"
 ISO_NAME="platine-live.iso"
 WORK_DIR="$(mktemp -d /tmp/platine-build-XXXXXX)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -55,9 +55,10 @@ fi
 log_ok "ISO tool: $ISO_TOOL"
 
 # ── Download Alpine Linux ──────────────────────────────────────────────────
-ALPINE_VER="3.19.1"
+ALPINE_VER="3.20.3"
 ALPINE_ISO="alpine-standard-${ALPINE_VER}-x86_64.iso"
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/${ALPINE_ISO}"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/${ALPINE_ISO}"
+ALPINE_SHA256="5a64c23bb0b0a4db41fe2784c617b59b22e8d04af67e6a9b0a56b5dfc9ab6b56"
 ALPINE_LOCAL="$WORK_DIR/alpine.iso"
 
 log_info "Downloading Alpine Linux ${ALPINE_VER}..."
@@ -67,6 +68,10 @@ elif cmd curl; then
     curl -L --progress-bar "$ALPINE_URL" -o "$ALPINE_LOCAL"
 else
     log_err "wget or curl required"
+fi
+if cmd sha256sum && [ -n "$ALPINE_SHA256" ]; then
+    echo "${ALPINE_SHA256}  ${ALPINE_LOCAL}" | sha256sum -c - >/dev/null 2>&1 || \
+        log_err "Alpine ISO checksum mismatch — download may be corrupted"
 fi
 log_ok "Alpine downloaded"
 
@@ -104,8 +109,8 @@ log_ok "Platine files injected"
 log_info "Fixing Alpine repositories..."
 mkdir -p "$ISO_ROOT/etc/apk"
 cat > "$ISO_ROOT/etc/apk/repositories" << 'REPOEOF'
-https://dl-cdn.alpinelinux.org/alpine/v3.19/main
-https://dl-cdn.alpinelinux.org/alpine/v3.19/community
+https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+https://dl-cdn.alpinelinux.org/alpine/v3.20/community
 REPOEOF
 log_ok "Repositories fixed"
 
@@ -114,41 +119,65 @@ log_info "Pre-downloading APK packages into ISO..."
 APK_CACHE_DIR="$ISO_ROOT/platine/apk-cache"
 mkdir -p "$APK_CACHE_DIR"
 
-# Alpine v3.19 x86_64 package index
-ALPINE_PKG_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.19"
+# Alpine v3.20 x86_64 package index
+ALPINE_PKG_BASE="https://dl-cdn.alpinelinux.org/alpine/v3.20"
 
-# Download package index to find exact filenames
-log_info "Fetching Alpine package index..."
-if cmd wget; then
-    wget -q --timeout=30 "$ALPINE_PKG_BASE/main/x86_64/APKINDEX.tar.gz" -O "$WORK_DIR/APKINDEX-main.tar.gz" 2>/dev/null || true
-    wget -q --timeout=30 "$ALPINE_PKG_BASE/community/x86_64/APKINDEX.tar.gz" -O "$WORK_DIR/APKINDEX-community.tar.gz" 2>/dev/null || true
-fi
-
-# Direct download of known package versions for Alpine 3.19
+# Package list: main vs community repo
 declare -A PKGS
 PKGS=(
-    ["bash"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["curl"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["dmidecode"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["smartmontools"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["pciutils"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["usbutils"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["lm-sensors"]="$ALPINE_PKG_BASE/community/x86_64"
-    ["hdparm"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["grep"]="$ALPINE_PKG_BASE/main/x86_64"
-    ["ca-certificates"]="$ALPINE_PKG_BASE/main/x86_64"
+    ["bash"]="main"
+    ["curl"]="main"
+    ["dmidecode"]="main"
+    ["smartmontools"]="main"
+    ["pciutils"]="main"
+    ["usbutils"]="main"
+    ["lm-sensors"]="community"
+    ["hdparm"]="main"
+    ["grep"]="main"
+    ["ca-certificates"]="main"
+    ["nvme-cli"]="main"
+    ["iw"]="main"
+    ["wireless-tools"]="main"
+    ["qrencode"]="community"
 )
 
+# Download package index for precise APK filenames
+log_info "Fetching Alpine package index..."
+for repo in main community; do
+    if cmd wget; then
+        wget -q --timeout=30 "$ALPINE_PKG_BASE/${repo}/x86_64/APKINDEX.tar.gz" \
+            -O "$WORK_DIR/APKINDEX-${repo}.tar.gz" 2>/dev/null || true
+    fi
+done
+
+get_apk_filename() {
+    local pkg="$1" repo="$2"
+    local idx="$WORK_DIR/APKINDEX-${repo}.tar.gz"
+    [ -f "$idx" ] || return 1
+    tar -xzO "$idx" APKINDEX 2>/dev/null | awk -v p="$pkg" '
+        BEGIN{RS="\n\n";ORS="\n\n"}
+        /^P:/{
+            block=$0
+            if(block ~ "^P:" p "\n") {
+                match(block, /^F:([^\n]+)/, a)
+                if(a[1]!="") { print a[1]; exit }
+            }
+        }' | head -1
+}
+
 for pkg in "${!PKGS[@]}"; do
-    base="${PKGS[$pkg]}"
+    repo="${PKGS[$pkg]}"
+    base="$ALPINE_PKG_BASE/${repo}/x86_64"
     log_info "Downloading $pkg..."
-    # Try to find and download the package
-    PKG_URL=$(wget -q -O- "$base/?C=N&O=D" 2>/dev/null | grep -o "\"${pkg}-[0-9][^\"]*\.apk\"" | head -1 | tr -d '"' || echo "")
-    if [ -n "$PKG_URL" ]; then
-        wget -q --timeout=15 "$base/$PKG_URL" -O "$APK_CACHE_DIR/${pkg}.apk" 2>/dev/null || true
+    fname=$(get_apk_filename "$pkg" "$repo" 2>/dev/null || echo "")
+    if [ -n "$fname" ]; then
+        wget -q --timeout=15 "${base}/${fname}" -O "$APK_CACHE_DIR/${pkg}.apk" 2>/dev/null || true
     else
-        # Fallback: try direct apk fetch via alpine docker approach
-        wget -q --timeout=15 -r -l1 -nd -A "${pkg}-*.apk" "$base/" -P "$APK_CACHE_DIR/" 2>/dev/null || true
+        # Fallback: scrape directory listing
+        PKG_URL=$(wget -q -O- "${base}/?C=N&O=D" 2>/dev/null \
+            | grep -o "\"${pkg}-[0-9][^\"]*\.apk\"" | head -1 | tr -d '"' || echo "")
+        [ -n "$PKG_URL" ] && \
+            wget -q --timeout=15 "${base}/${PKG_URL}" -O "$APK_CACHE_DIR/${pkg}.apk" 2>/dev/null || true
     fi
 done
 
@@ -164,11 +193,11 @@ echo "nameserver 1.1.1.1" >> /etc/resolv.conf
 APK_CACHE="/media/usb/platine/apk-cache"
 
 # Setup repos
-echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/main" > /etc/apk/repositories
-echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/community" >> /etc/apk/repositories
+echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/main" > /etc/apk/repositories
+echo "https://dl-cdn.alpinelinux.org/alpine/v3.20/community" >> /etc/apk/repositories
 
 # Check if tools already installed
-if command -v bash >/dev/null 2>&1 && command -v dmidecode >/dev/null 2>&1; then
+if command -v bash >/dev/null 2>&1 && command -v dmidecode >/dev/null 2>&1 && command -v nvme >/dev/null 2>&1; then
     echo "Tools already installed"
     exit 0
 fi
@@ -182,7 +211,8 @@ fi
 # Fallback: online install
 echo "Installing from internet..."
 apk update 2>/dev/null
-apk add --no-cache bash curl dmidecode smartmontools pciutils usbutils lm-sensors hdparm grep ca-certificates 2>/dev/null
+apk add --no-cache bash curl dmidecode smartmontools pciutils usbutils lm-sensors hdparm grep \
+    ca-certificates nvme-cli iw wireless-tools qrencode 2>/dev/null
 INSTALLEOF
 chmod +x "$ISO_ROOT/platine/install-tools.sh"
 

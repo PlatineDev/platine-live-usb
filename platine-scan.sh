@@ -1,1567 +1,1112 @@
 #!/usr/bin/env bash
 # ============================================================
-#  PLATINE LIVE USB - Hardware Scanner v1.0
-#  github.com/Platine-dev/platine
+#  PLATINE LIVE USB — Hardware Scanner v2.0.0
+#  github.com/platinedev/platine-live-usb
 #  platine.dev
 #
-#  Boot this from USB on any broken PC/laptop.
-#  Detects ALL hardware, generates interactive map,
-#  streams live data to your phone via WebSocket.
+#  Boot from USB on any PC/laptop — full hardware scan
+#  streamed live to your phone via platine.dev
 #
-#  Usage: sudo bash platine-scan.sh [--silent] [--ws]
-#  Output: platine_map.json (compatible with platine-v5.html)
+#  Usage: sudo bash platine-scan.sh [--silent] [--output=FILE]
+#  Output: /tmp/platine_map.json
 # ============================================================
 
 set -uo pipefail
 
-# ── Version & ID ─────────────────────────────────────────────
-PLATINE_VERSION="1.0.0"
-SCAN_DATE=$(date '+%Y-%m-%d %H:%M:%S')
-SCAN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c1-8 | tr '[:lower:]' '[:upper:]' || echo "PLATINE1")
-OUTPUT_DIR="${HOME}"
+PLATINE_VERSION="2.0.0"
+SCANNED_AT=$(date '+%Y-%m-%dT%H:%M:%S')
+SCAN_START=$SECONDS
+SCAN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c1-8 | tr '[:lower:]' '[:upper:]' 2>/dev/null \
+          || printf '%08X' "$$")
+OUTPUT_FILE="/tmp/platine_map.json"
 SILENT=false
-WS_MODE=false
-WS_PORT=8765
+PLATINE_API="https://platine.dev/api/live"
 
 for arg in "$@"; do
     case "$arg" in
-        --silent)    SILENT=true ;;
-        --ws)        WS_MODE=true ;;
-        --port=*)    WS_PORT="${arg#*=}" ;;
-        --output=*)  OUTPUT_DIR="${arg#*=}" ;;
+        --silent)   SILENT=true ;;
+        --output=*) OUTPUT_FILE="${arg#*=}" ;;
     esac
 done
 
-# ── Colors ───────────────────────────────────────────────────
-R='\033[0;31m' Y='\033[1;33m' G='\033[0;32m'
-C='\033[0;36m' W='\033[1;37m' D='\033[0;90m' N='\033[0m'
-[ "$SILENT" = true ] && R='' Y='' G='' C='' W='' D='' N=''
+# ── Temp dir ──────────────────────────────────────────────────
+TMPD=$(mktemp -d /tmp/platine_scan_XXXXXX)
+trap 'rm -rf "$TMPD"' EXIT
 
-log_header() {
-    [ "$SILENT" = true ] && return
-    clear
-    printf "${W}"
-    printf "  ██████╗ ██╗      █████╗ ████████╗██╗███╗   ██╗███████╗\n"
-    printf "  ██╔══██╗██║     ██╔══██╗╚══██╔══╝██║████╗  ██║██╔════╝\n"
-    printf "  ██████╔╝██║     ███████║   ██║   ██║██╔██╗ ██║█████╗  \n"
-    printf "  ██╔═══╝ ██║     ██╔══██║   ██║   ██║██║╚██╗██║██╔══╝  \n"
-    printf "  ██║     ███████╗██║  ██║   ██║   ██║██║ ╚████║███████╗\n"
-    printf "  ╚═╝     ╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝  ╚═══╝╚══════╝\n"
-    printf "${N}\n"
-    printf "  ${C}Platine Live USB - Scanner v${PLATINE_VERSION}${N}\n"
-    printf "  ${D}Scan ID: ${SCAN_ID}${N}\n"
-    printf "  ${D}${SCAN_DATE}${N}\n\n"
-    printf "  ${D}─────────────────────────────────────────────────────${N}\n\n"
-}
+# ── Colors ────────────────────────────────────────────────────
+if [ "$SILENT" = true ]; then
+    R='' Y='' G='' C='' W='' D='' N='' B=''
+else
+    R='\033[0;31m' Y='\033[1;33m' G='\033[0;32m'
+    C='\033[0;36m' W='\033[1;37m' D='\033[0;90m' N='\033[0m' B='\033[1m'
+fi
 
-log_section() { [ "$SILENT" = false ] && printf "\n  ${C}[ %s ]${N}\n" "$1"; }
-log_ok()      { [ "$SILENT" = false ] && printf "  ${G}✓ %s${N}\n" "$1"; }
-log_warn()    { [ "$SILENT" = false ] && printf "  ${Y}⚠ %s${N}\n" "$1"; }
-log_err()     { [ "$SILENT" = false ] && printf "  ${R}✗ %s${N}\n" "$1"; }
-log_info()    { [ "$SILENT" = false ] && printf "  ${D}· %s${N}\n" "$1"; }
+# ── Helpers ───────────────────────────────────────────────────
+cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# ── Helpers ──────────────────────────────────────────────────
-cmd()     { command -v "$1" &>/dev/null; }
-safe()    { "$@" 2>/dev/null || true; }
-trim()    { echo "$1" | xargs; }
-
-# JSON escaping - no jq needed
 jstr() {
-    local v="$1"
+    local v="${1:-}"
     v="${v//\\/\\\\}"
     v="${v//\"/\\\"}"
     v="${v//$'\n'/ }"
     v="${v//$'\r'/}"
+    v="${v//	/ }"
     printf '"%s"' "$v"
 }
+
 jnum() {
-    local v="${1//[^0-9.-]/}"
-    # Remove leading/trailing dashes that aren't negative signs
-    v=$(echo "$v" | sed 's/^-*$//' | sed 's/[^0-9.]//g')
-    [ -z "$v" ] && echo "null" || echo "$v"
+    local v="${1:-}"
+    v="${v// /}"
+    [ -z "$v" ] && { printf 'null'; return; }
+    awk -v n="$v" 'BEGIN{
+        if (n ~ /^-?[0-9]+(\.[0-9]+)?$/) printf "%s", n+0
+        else printf "null"
+    }' 2>/dev/null || printf 'null'
 }
 
-# ── Network & DNS setup (Alpine Live USB) ────────────────────
+jbool() { [ "${1:-false}" = "true" ] && printf 'true' || printf 'false'; }
+
+# add_problem severity component title cause action probfile
+add_problem() {
+    printf '{"severity":%s,"component":%s,"title":%s,"cause":%s,"action":%s}\n' \
+        "$(jstr "${1:-}")" "$(jstr "${2:-}")" "$(jstr "${3:-}")" \
+        "$(jstr "${4:-}")" "$(jstr "${5:-}")" >> "${6:-$TMPD/probs_misc.ndjson}"
+}
+
+# ── Module status tracking ────────────────────────────────────
+MODULES="cpu ram storage battery gpu network thermals audio usb os security"
+st_set()  { printf '%s\n' "$2" > "$TMPD/status_$1"; }
+st_get()  { cat "$TMPD/status_$1" 2>/dev/null || printf 'pending'; }
+sum_set() { printf '%s\n' "$2" > "$TMPD/summary_$1"; }
+sum_get() { cat "$TMPD/summary_$1" 2>/dev/null || printf '—'; }
+
+for _m in $MODULES; do st_set "$_m" "pending"; done
+
+# ── Terminal UI ───────────────────────────────────────────────
+render_ui() {
+    [ "$SILENT" = true ] && return
+    local done_count=0 total=0 active_module="" _m s
+
+    for _m in $MODULES; do
+        total=$((total + 1))
+        s=$(st_get "$_m")
+        case "$s" in
+            done|error) done_count=$((done_count + 1)) ;;
+            running) active_module="$_m" ;;
+        esac
+    done
+
+    local pct bar="" i
+    pct=$(( total > 0 ? done_count * 100 / total : 0 ))
+    local bar_done=$(( pct * 20 / 100 ))
+    local bar_rest=$(( 20 - bar_done ))
+    i=0; while [ $i -lt $bar_done ]; do bar="${bar}█"; i=$((i+1)); done
+    i=0; while [ $i -lt $bar_rest ]; do bar="${bar}─"; i=$((i+1)); done
+
+    printf '\033[H\033[2J'
+    printf "${W}  ─────────────────────────────────────────────────────${N}\n"
+    printf "${W}  Platine Live USB v%-6s — Alpine Linux${N}\n" "$PLATINE_VERSION"
+    printf "${W}  ─────────────────────────────────────────────────────${N}\n\n"
+
+    local machine_line
+    machine_line=$(cat "$TMPD/machine_line" 2>/dev/null || echo "")
+    [ -n "$machine_line" ] && printf "  ${C}%s${N}\n\n" "$machine_line"
+
+    printf "  ${W}[%s]${N} ${B}%d%%${N}" "$bar" "$pct"
+    if [ -n "$active_module" ]; then
+        printf "  Scanning %s..." "$active_module"
+    else
+        printf "  Complete"
+    fi
+    printf "\n\n"
+
+    for _m in $MODULES; do
+        local icon summ label
+        s=$(st_get "$_m")
+        summ=$(sum_get "$_m")
+        label=$(printf '%-10s' "$_m")
+        case "$s" in
+            done)    icon="${G}✓${N}" ;;
+            running) icon="${Y}⟳${N}" ;;
+            error)   icon="${R}✗${N}" ;;
+            *)       icon="${D}·${N}" ;;
+        esac
+        printf "  %b %-10s %s\n" "$icon" "$label" "$summ"
+    done
+    printf "\n"
+}
+
+# ── Network Setup (usb0 first — phone tethering) ──────────────
 setup_network() {
-    # Fix DNS first — Alpine live doesn't persist DNS
-    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-
-    # Try to get IP on common interfaces if not already connected
-    for iface in eth0 usb0 enp0s3 enp1s0; do
-        if ip link show "$iface" 2>/dev/null | grep -q "UP"; then
-            udhcpc -i "$iface" -t 5 -T 2 -q 2>/dev/null || true
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf 2>/dev/null || true
+    local iface
+    for iface in usb0 usb1 eth0 enp0s3 enp1s0 enp2s0 eno1 wlan0 wlp2s0 wlp3s0; do
+        ip link show "$iface" >/dev/null 2>&1 || continue
+        ip link set "$iface" up 2>/dev/null || true
+        if udhcpc -i "$iface" -t 5 -T 2 -q 2>/dev/null; then
+            printf '%s' "$iface" > "$TMPD/net_iface_used"
+            return 0
         fi
     done
-
-    # Load Realtek WiFi driver
-    modprobe rtw_8723de 2>/dev/null || true
-    modprobe rtw_8822be 2>/dev/null || true
-    modprobe rtw_8822ce 2>/dev/null || true
+    return 1
 }
 
-# ── Auto-install tools ───────────────────────────────────────
-install_tools() {
-    # Use space-separated string instead of arrays (ash compatible)
-    NEED=""
-    cmd lshw      || NEED="$NEED lshw"
-    cmd smartctl  || NEED="$NEED smartmontools"
-    cmd dmidecode || NEED="$NEED dmidecode"
-    cmd sensors   || NEED="$NEED lm-sensors"
-    cmd lspci     || NEED="$NEED pciutils"
-    cmd lsusb     || NEED="$NEED usbutils"
-    cmd hdparm    || NEED="$NEED hdparm"
-    cmd curl      || NEED="$NEED curl"
-    cmd bash      || NEED="$NEED bash"
+# ── Machine identity (fast — needed for UI header) ────────────
+scan_machine() {
+    local VENDOR="" MODEL="" SERIAL="" UUID="" CHASSIS="" BIOS_VER="" BIOS_DATE=""
 
-    if [ -n "$NEED" ]; then
-        log_info "Installing tools:$NEED"
-        if cmd apk; then
-            # Set repos first
-            echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/main" > /etc/apk/repositories
-            echo "https://dl-cdn.alpinelinux.org/alpine/v3.19/community" >> /etc/apk/repositories
-            apk add --no-cache $NEED 2>/dev/null || true
-        elif cmd apt-get; then
-            apt-get install -y -q $NEED 2>/dev/null || true
-        elif cmd pacman;  then
-            pacman -S --noconfirm $NEED 2>/dev/null || true
-        elif cmd dnf; then
-            dnf install -y $NEED 2>/dev/null || true
+    if cmd dmidecode; then
+        VENDOR=$(dmidecode -s system-manufacturer   2>/dev/null | head -1 | xargs 2>/dev/null || true)
+        MODEL=$(dmidecode -s system-product-name    2>/dev/null | head -1 | xargs 2>/dev/null || true)
+        SERIAL=$(dmidecode -s system-serial-number  2>/dev/null | head -1 | xargs 2>/dev/null || true)
+        UUID=$(dmidecode -s system-uuid             2>/dev/null | head -1 | xargs 2>/dev/null || true)
+        CHASSIS=$(dmidecode -s chassis-type         2>/dev/null | head -1 | xargs 2>/dev/null || true)
+        BIOS_VER=$(dmidecode -s bios-version        2>/dev/null | head -1 | xargs 2>/dev/null || true)
+        BIOS_DATE=$(dmidecode -s bios-release-date  2>/dev/null | head -1 | xargs 2>/dev/null || true)
+    fi
+    [ -z "$VENDOR" ]   && VENDOR=$(cat /sys/class/dmi/id/sys_vendor     2>/dev/null | xargs 2>/dev/null || true)
+    [ -z "$MODEL" ]    && MODEL=$(cat /sys/class/dmi/id/product_name    2>/dev/null | xargs 2>/dev/null || true)
+    [ -z "$CHASSIS" ]  && CHASSIS=$(cat /sys/class/dmi/id/chassis_type  2>/dev/null || true)
+    [ -z "$BIOS_VER" ] && BIOS_VER=$(cat /sys/class/dmi/id/bios_version 2>/dev/null | xargs 2>/dev/null || true)
+
+    printf '%s'  "${VENDOR:-}"  > "$TMPD/machine_vendor"
+    printf '%s'  "${MODEL:-}"   > "$TMPD/machine_model"
+    printf '%s'  "${CHASSIS:-}" > "$TMPD/machine_chassis"
+    printf '%s · BIOS %s' "${VENDOR:-Unknown} ${MODEL:-}" "${BIOS_VER:-?}" > "$TMPD/machine_line"
+
+    cat > "$TMPD/json_machine.json" <<JSON
+{
+  "manufacturer": $(jstr "${VENDOR:-}"),
+  "model": $(jstr "${MODEL:-}"),
+  "serial": $(jstr "${SERIAL:-}"),
+  "uuid": $(jstr "${UUID:-}"),
+  "chassis_type": $(jstr "${CHASSIS:-}"),
+  "bios_version": $(jstr "${BIOS_VER:-}"),
+  "bios_date": $(jstr "${BIOS_DATE:-}")
+}
+JSON
+}
+
+# ── Scan: CPU ─────────────────────────────────────────────────
+scan_cpu() {
+    st_set cpu running
+    local pfile="$TMPD/probs_cpu.ndjson"
+
+    local CPU_MODEL CPU_CORES CPU_THREADS CPU_SOCKETS CPU_ARCH CPU_VENDOR CPU_FLAGS
+    CPU_MODEL=$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs 2>/dev/null || echo "Unknown")
+    CPU_CORES=$(grep '^cpu cores' /proc/cpuinfo 2>/dev/null | head -1 | awk '{print $NF}' || echo "")
+    [ -z "${CPU_CORES:-}" ] && CPU_CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")
+    CPU_THREADS=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")
+    CPU_SOCKETS=$(grep '^physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l 2>/dev/null || echo "1")
+    CPU_ARCH=$(uname -m 2>/dev/null || echo "")
+    CPU_VENDOR=$(grep -m1 '^vendor_id' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs 2>/dev/null || echo "")
+    CPU_FLAGS=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs 2>/dev/null | \
+                tr ' ' ',' | cut -c1-300 || echo "")
+
+    local CPU_CUR_MHZ="" CPU_MAX_MHZ="" CPU_BASE_MHZ=""
+    CPU_CUR_MHZ=$(grep -m1 '^cpu MHz' /proc/cpuinfo 2>/dev/null | awk '{printf "%.0f",$NF}' || echo "")
+    CPU_MAX_MHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null | \
+                  awk '{printf "%.0f",$1/1000}' || echo "")
+    CPU_BASE_MHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/base_frequency 2>/dev/null | \
+                   awk '{printf "%.0f",$1/1000}' 2>/dev/null || \
+                   cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_base_freq 2>/dev/null | \
+                   awk '{printf "%.0f",$1/1000}' 2>/dev/null || echo "")
+
+    local CPU_L1D="" CPU_L1I="" CPU_L2="" CPU_L3=""
+    if cmd lscpu; then
+        local lscpu_out
+        lscpu_out=$(lscpu 2>/dev/null || echo "")
+        CPU_L1D=$(echo "$lscpu_out" | grep -i '^L1d '  | awk '{print $3$4}' || echo "")
+        CPU_L1I=$(echo "$lscpu_out" | grep -i '^L1i '  | awk '{print $3$4}' || echo "")
+        CPU_L2=$(echo "$lscpu_out"  | grep -iE '^L2 '  | awk '{print $3$4}' || echo "")
+        CPU_L3=$(echo "$lscpu_out"  | grep -iE '^L3 '  | awk '{print $3$4}' || echo "")
+    fi
+    [ -z "$CPU_L2" ] && CPU_L2=$(cat /sys/devices/system/cpu/cpu0/cache/index2/size 2>/dev/null || echo "")
+    [ -z "$CPU_L3" ] && CPU_L3=$(cat /sys/devices/system/cpu/cpu0/cache/index3/size 2>/dev/null || echo "")
+
+    # Per-core temps via hwmon
+    local CPU_TEMP="" PER_CORE_TEMPS="" hwmon hname tf lbl tc
+    for hwmon in /sys/class/hwmon/hwmon*/; do
+        [ -d "$hwmon" ] || continue
+        hname=$(cat "${hwmon}name" 2>/dev/null || echo "")
+        echo "$hname" | grep -qiE "coretemp|k10temp|zenpower|acpitz" || continue
+        for tf in "${hwmon}"temp*_input; do
+            [ -f "$tf" ] || continue
+            lbl=$(cat "${tf/_input/_label}" 2>/dev/null || echo "")
+            tc=$(awk '{printf "%.1f",$1/1000}' "$tf" 2>/dev/null || echo "")
+            [ -z "$tc" ] && continue
+            if echo "$lbl" | grep -qiE "^Package|^Tdie|^CPU$|^CPU Temperature$"; then
+                CPU_TEMP="$tc"
+            elif echo "$lbl" | grep -qiE "^Core [0-9]|^Tccd[0-9]|^CPU Core [0-9]"; then
+                PER_CORE_TEMPS="${PER_CORE_TEMPS}$(jnum "$tc"),"
+            fi
+        done
+        [ -n "$CPU_TEMP" ] && break
+    done
+    [ -z "$CPU_TEMP" ] && CPU_TEMP=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | \
+                                     awk '{printf "%.1f",$1/1000}' 2>/dev/null || echo "")
+    PER_CORE_TEMPS="${PER_CORE_TEMPS%,}"
+
+    # Throttle detection
+    local THROTTLE_ACTIVE="false" THROTTLE_REASON="" THROTTLE_COUNT="0"
+    THROTTLE_COUNT=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count 2>/dev/null || echo "0")
+    if [ "${THROTTLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+        THROTTLE_ACTIVE="true"; THROTTLE_REASON="thermal"
+    fi
+    if [ -n "${CPU_CUR_MHZ:-}" ] && [ -n "${CPU_MAX_MHZ:-}" ] && [ "${CPU_MAX_MHZ:-0}" -gt 0 ] 2>/dev/null; then
+        local ratio
+        ratio=$(awk -v c="${CPU_CUR_MHZ}" -v m="${CPU_MAX_MHZ}" \
+            'BEGIN{if(m>0) printf "%.0f",c*100/m; else print 100}' 2>/dev/null || echo "100")
+        if [ "${ratio:-100}" -lt 60 ] 2>/dev/null; then
+            THROTTLE_ACTIVE="true"
+            if [ -n "${CPU_TEMP:-}" ] && awk -v t="${CPU_TEMP}" 'BEGIN{exit !(t+0>85)}' 2>/dev/null; then
+                THROTTLE_REASON="thermal"
+            else
+                THROTTLE_REASON="${THROTTLE_REASON:-power_limit}"
+            fi
         fi
     fi
-}
 
-# ── Root warning ─────────────────────────────────────────────
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        log_warn "Not running as root - some data will be unavailable"
-        log_info "Tip: sudo bash platine-scan.sh"
+    if [ "$THROTTLE_ACTIVE" = "true" ]; then
+        add_problem "warning" "cpu" "CPU throttling detected" \
+            "Throttle reason: ${THROTTLE_REASON:-unknown} (event count: $THROTTLE_COUNT)" \
+            "Check cooling system and power delivery. Clean heatsink if thermal." "$pfile"
     fi
-}
-
-# ── WebSocket server ─────────────────────────────────────────
-start_ws_server() {
-    ! cmd python3 && log_warn "python3 not found - WebSocket disabled" && return
-
-    local ip
-    ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}' || echo "127.0.0.1")
-
-    # Write ws-server to temp file using printf (avoids bash parsing Python as bash syntax)
-    printf '%s\n' \
-        'import sys, os, asyncio, json' \
-        'PORT = int(sys.argv[1])' \
-        'DATA_FILE = sys.argv[2]' \
-        'try:' \
-        '    import websockets; USE_WS = True' \
-        'except ImportError:' \
-        '    USE_WS = False' \
-        'if USE_WS:' \
-        '    async def handler(ws, path):' \
-        '        last = 0' \
-        '        try:' \
-        '            while True:' \
-        '                if os.path.exists(DATA_FILE):' \
-        '                    mtime = os.path.getmtime(DATA_FILE)' \
-        '                    if mtime != last:' \
-        '                        last = mtime' \
-        '                        with open(DATA_FILE) as f: data = f.read()' \
-        '                        await ws.send(data)' \
-        '                await asyncio.sleep(3)' \
-        '        except Exception: pass' \
-        '    async def main():' \
-        '        async with websockets.serve(handler, "0.0.0.0", PORT):' \
-        '            await asyncio.Future()' \
-        '    asyncio.run(main())' \
-        'else:' \
-        '    from http.server import HTTPServer, BaseHTTPRequestHandler' \
-        '    class H(BaseHTTPRequestHandler):' \
-        '        def log_message(self, *a): pass' \
-        '        def do_GET(self):' \
-        '            try:' \
-        '                with open(DATA_FILE) as f: d = f.read()' \
-        '                self.send_response(200)' \
-        '                self.send_header("Content-Type","application/json")' \
-        '                self.send_header("Access-Control-Allow-Origin","*")' \
-        '                self.end_headers()' \
-        '                self.wfile.write(d.encode())' \
-        '            except: self.send_response(503); self.end_headers()' \
-        '    HTTPServer(("0.0.0.0", PORT), H).serve_forever()' \
-        > "$TMPD/ws_server.py"
-
-    python3 "$TMPD/ws_server.py" "$WS_PORT" "$LIVE_FILE" &
-
-    WS_PID=$!
-    log_ok "Live server started (PID $WS_PID)"
-    printf "\n  ${W}┌─────────────────────────────────────────────────────┐${N}\n"
-    printf   "  ${W}│  Open on your phone (same WiFi):                    │${N}\n"
-    printf   "  ${W}│  ws://%-45s│${N}\n"  "${ip}:${WS_PORT}"
-    printf   "  ${W}│  http://%-44s│${N}\n" "${ip}:${WS_PORT}"
-    printf   "  ${W}└─────────────────────────────────────────────────────┘${N}\n\n"
-}
-
-# ── Temp dir ─────────────────────────────────────────────────
-TMPD=$(mktemp -d /tmp/platine-XXXXXX)
-LIVE_FILE="$TMPD/platine_live.json"
-trap 'rm -rf "$TMPD"' EXIT
-
-# Write the live-patch Python helper
-printf '%s\n' \
-    'import sys, json' \
-    'try:' \
-    '    src, dst, qt_json, load, ram, ts = sys.argv[1:]' \
-    '    with open(src) as f: d = json.load(f)' \
-    '    if qt_json:' \
-    '        pairs = [p.split(":", 1) for p in qt_json.split(",") if ":" in p]' \
-    '        d.setdefault("thermals", {})["live_temps"] = {k.strip(chr(34)): float(v) for k, v in pairs}' \
-    '    d.setdefault("performance", {})["live_cpu_load"] = float(load)' \
-    '    d.setdefault("performance", {})["live_ram_free_gb"] = float(ram)' \
-    '    d["scan_date"] = ts' \
-    '    with open(dst, "w") as f: json.dump(d, f)' \
-    'except: pass' \
-    > /tmp/platine_patch.py
-
-# ============================================================
-# BOOT
-# ============================================================
-log_header
-check_root
-setup_network
-install_tools
-[ "$WS_MODE" = true ] && start_ws_server
-
-# ============================================================
-# 1. MACHINE IDENTITY
-# ============================================================
-log_section "MACHINE IDENTITY"
-
-dmi() { dmidecode -s "$1" 2>/dev/null | head -1 | xargs || echo ""; }
-dmi_field() { dmidecode -t "$1" 2>/dev/null | grep -m1 "$2:" | sed 's/.*: //' | xargs || echo ""; }
-
-MANUFACTURER=$(dmi "system-manufacturer")
-MODEL=$(dmi "system-product-name")
-MODEL_VERSION=$(dmi "system-version")
-BOARD_PRODUCT=$(dmi "baseboard-product-name")
-BOARD_VENDOR=$(dmi "baseboard-manufacturer")
-BOARD_VERSION=$(dmi "baseboard-version")
-BOARD_SERIAL=$(dmi "baseboard-serial-number")
-SYSTEM_SERIAL=$(dmi "system-serial-number")
-BIOS_VENDOR=$(dmi "bios-vendor")
-BIOS_VERSION=$(dmi "bios-version")
-BIOS_DATE=$(dmi "bios-release-date")
-CHASSIS_TYPE=$(dmi_field 3 "Type")
-
-# Fallback via /sys if dmidecode not available
-[ -z "$MANUFACTURER" ] && MANUFACTURER=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | xargs || echo "Unknown")
-[ -z "$MODEL" ]        && MODEL=$(cat /sys/class/dmi/id/product_name 2>/dev/null | xargs || echo "Unknown")
-
-MODEL_ID=$(printf '%s_%s' "$MANUFACTURER" "$MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | sed 's/__*/_/g')
-
-log_ok "Manufacturer : $MANUFACTURER"
-log_ok "Model        : $MODEL"
-log_ok "Board        : $BOARD_PRODUCT $BOARD_VERSION"
-log_ok "Serial       : $SYSTEM_SERIAL"
-log_ok "Chassis      : $CHASSIS_TYPE"
-log_ok "BIOS         : $BIOS_VERSION ($BIOS_DATE)"
-
-# ============================================================
-# 2. CPU
-# ============================================================
-log_section "CPU"
-
-CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo "Unknown")
-CPU_VENDOR=$(grep -m1 "vendor_id" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "")
-CPU_PHYSICAL=$(grep "^physical id" /proc/cpuinfo 2>/dev/null | sort -u | wc -l || echo "1")
-[ "$CPU_PHYSICAL" -lt 1 ] && CPU_PHYSICAL=1
-CPU_CORES=$(grep "^cpu cores" /proc/cpuinfo 2>/dev/null | head -1 | awk '{print $NF}' || echo "1")
-CPU_LOGICAL=$(nproc 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "1")
-CPU_THREADS=$((CPU_LOGICAL / CPU_PHYSICAL))
-CPU_STEPPING=$(grep -m1 "stepping" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "")
-CPU_MICROCODE=$(grep -m1 "microcode" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "")
-CPU_FAMILY=$(grep -m1 "cpu family" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo "")
-CPU_ARCH=$(uname -m 2>/dev/null || echo "x86_64")
-
-CPU_MAX_MHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null | awk '{printf "%.0f",$1/1000}' || \
-              grep -m1 "cpu MHz" /proc/cpuinfo 2>/dev/null | awk -F: '{printf "%.0f",$2}' || echo "0")
-CPU_CUR_MHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null | awk '{printf "%.0f",$1/1000}' || echo "$CPU_MAX_MHZ")
-CPU_MIN_MHZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq 2>/dev/null | awk '{printf "%.0f",$1/1000}' || echo "0")
-CPU_GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
-
-# L2/L3 cache
-CPU_L2=$(lscpu 2>/dev/null | grep "^L2 cache" | awk '{print $3}' || echo "")
-CPU_L3=$(lscpu 2>/dev/null | grep "^L3 cache" | awk '{print $3}' || echo "")
-
-# CPU temperature - try multiple sources
-CPU_TEMP="null"
-for hwmon in /sys/class/hwmon/hwmon*/; do
-    hname=$(cat "${hwmon}name" 2>/dev/null || echo "")
-    echo "$hname" | grep -qiE "coretemp|k10temp|zenpower|cpu_thermal" || continue
-    for tf in "${hwmon}"temp*_input; do
-        [ -f "$tf" ] || continue
-        label=$(cat "${tf/_input/_label}" 2>/dev/null || echo "")
-        echo "$label" | grep -qiE "Package|Tdie|Tccd|CPU" || continue
-        raw=$(cat "$tf" 2>/dev/null || echo "0")
-        CPU_TEMP=$(awk -v r="$raw" 'BEGIN{printf "%.1f",r/1000}')
-        break 2
-    done
-done
-# Fallback: first available temp
-if [ "$CPU_TEMP" = "null" ]; then
-    for tf in /sys/class/hwmon/hwmon*/temp1_input; do
-        [ -f "$tf" ] || continue
-        raw=$(cat "$tf" 2>/dev/null || echo "0")
-        CPU_TEMP=$(awk -v r="$raw" 'BEGIN{printf "%.1f",r/1000}')
-        break
-    done
-fi
-
-# Throttle count
-CPU_THROTTLE=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count 2>/dev/null || echo "0")
-
-# CPU flags
-CPU_FLAGS=$(grep -m1 "^flags" /proc/cpuinfo 2>/dev/null | cut -d: -f2- || echo "")
-HAS_VT=$(echo "$CPU_FLAGS" | grep -qwE "vmx|svm" && echo "true" || echo "false")
-HAS_AES=$(echo "$CPU_FLAGS" | grep -qw "aes" && echo "true" || echo "false")
-HAS_AVX=$(echo "$CPU_FLAGS" | grep -qw "avx" && echo "true" || echo "false")
-HAS_AVX2=$(echo "$CPU_FLAGS" | grep -qw "avx2" && echo "true" || echo "false")
-
-# Load
-CPU_LOAD=$(top -bn1 2>/dev/null | grep "^%Cpu" | awk '{printf "%.1f",100-$8}' || echo "0")
-
-# Frequency ratio (throttle detection)
-CPU_FREQ_RATIO="null"
-if [ "$CPU_MAX_MHZ" -gt 0 ] 2>/dev/null && [ "$CPU_CUR_MHZ" -gt 0 ] 2>/dev/null; then
-    CPU_FREQ_RATIO=$(awk -v cur="$CPU_CUR_MHZ" -v max="$CPU_MAX_MHZ" 'BEGIN{printf "%.0f",(cur/max)*100}')
-fi
-
-# Log
-if [ "$CPU_TEMP" != "null" ]; then
-    is_crit=$(awk -v t="$CPU_TEMP" 'BEGIN{print (t>90)?1:0}')
-    is_high=$(awk -v t="$CPU_TEMP" 'BEGIN{print (t>75)?1:0}')
-    if   [ "$is_crit" = "1" ]; then log_err  "CPU: $CPU_MODEL - TEMP CRITICAL: ${CPU_TEMP}°C"
-    elif [ "$is_high" = "1" ]; then log_warn "CPU: $CPU_MODEL - TEMP HIGH: ${CPU_TEMP}°C"
-    else                            log_ok   "CPU: $CPU_MODEL - ${CPU_TEMP}°C · ${CPU_CORES}C/${CPU_LOGICAL}T"
+    if [ -n "${CPU_TEMP:-}" ] && awk -v t="${CPU_TEMP}" 'BEGIN{exit !(t+0>95)}' 2>/dev/null; then
+        add_problem "critical" "cpu" "CPU temperature critical" \
+            "CPU at ${CPU_TEMP}°C — threshold 95°C" \
+            "Shut down immediately. Replace thermal paste and check heatsink." "$pfile"
+    elif [ -n "${CPU_TEMP:-}" ] && awk -v t="${CPU_TEMP}" 'BEGIN{exit !(t+0>85)}' 2>/dev/null; then
+        add_problem "warning" "cpu" "CPU temperature high" \
+            "CPU at ${CPU_TEMP}°C — threshold 85°C" \
+            "Check cooling. Clean heatsink vents." "$pfile"
     fi
-else
-    log_ok "CPU: $CPU_MODEL · ${CPU_CORES}C/${CPU_LOGICAL}T · ${CPU_MAX_MHZ}MHz"
-fi
 
-CPU_JSON=$(printf '[{"name":%s,"vendor":%s,"architecture":%s,"physical_cpus":%s,"cores":%s,"logical_processors":%s,"threads_per_core":%s,"base_clock_mhz":%s,"current_clock_mhz":%s,"min_clock_mhz":%s,"governor":%s,"l2_cache":%s,"l3_cache":%s,"temp_celsius":%s,"load_percent":%s,"family":%s,"stepping":%s,"microcode":%s,"virtualization":%s,"aes_ni":%s,"avx":%s,"avx2":%s,"throttle_count":%s,"freq_ratio_pct":%s}]' \
-    "$(jstr "$CPU_MODEL")" "$(jstr "$CPU_VENDOR")" "$(jstr "$CPU_ARCH")" "$CPU_PHYSICAL" \
-    "$(jnum "$CPU_CORES")" "$(jnum "$CPU_LOGICAL")" "$(jnum "$CPU_THREADS")" \
-    "$(jnum "$CPU_MAX_MHZ")" "$(jnum "$CPU_CUR_MHZ")" "$(jnum "$CPU_MIN_MHZ")" \
-    "$(jstr "$CPU_GOVERNOR")" "$(jstr "$CPU_L2")" "$(jstr "$CPU_L3")" \
-    "$CPU_TEMP" "$(jnum "$CPU_LOAD")" "$(jstr "$CPU_FAMILY")" "$(jstr "$CPU_STEPPING")" \
-    "$(jstr "$CPU_MICROCODE")" "$HAS_VT" "$HAS_AES" "$HAS_AVX" "$HAS_AVX2" \
-    "$(jnum "$CPU_THROTTLE")" "$CPU_FREQ_RATIO")
+    local summ="${CPU_MODEL} · ${CPU_CORES}C/${CPU_THREADS}T"
+    [ -n "${CPU_TEMP:-}" ] && summ="${summ} · ${CPU_TEMP}°C"
+    [ "$THROTTLE_ACTIVE" = "true" ] && summ="${summ} ⚠ THROTTLE"
+    sum_set cpu "$summ"
 
-# ============================================================
-# 3. MEMORY - SLOT BY SLOT
-# ============================================================
-log_section "MEMORY"
+    cat > "$TMPD/json_cpu.json" <<JSON
+{
+  "model": $(jstr "$CPU_MODEL"),
+  "vendor": $(jstr "${CPU_VENDOR:-}"),
+  "architecture": $(jstr "${CPU_ARCH:-}"),
+  "cores": $(jnum "${CPU_CORES:-}"),
+  "threads": $(jnum "${CPU_THREADS:-}"),
+  "sockets": $(jnum "${CPU_SOCKETS:-}"),
+  "current_mhz": $(jnum "${CPU_CUR_MHZ:-}"),
+  "base_mhz": $(jnum "${CPU_BASE_MHZ:-}"),
+  "max_mhz": $(jnum "${CPU_MAX_MHZ:-}"),
+  "temp_c": $(jnum "${CPU_TEMP:-}"),
+  "per_core_temps_c": [${PER_CORE_TEMPS:-}],
+  "throttle_active": $(jbool "$THROTTLE_ACTIVE"),
+  "throttle_reason": $(jstr "${THROTTLE_REASON:-}"),
+  "throttle_count": $(jnum "${THROTTLE_COUNT:-0}"),
+  "cache": {
+    "l1d": $(jstr "${CPU_L1D:-}"),
+    "l1i": $(jstr "${CPU_L1I:-}"),
+    "l2": $(jstr "${CPU_L2:-}"),
+    "l3": $(jstr "${CPU_L3:-}")
+  },
+  "flags": $(jstr "${CPU_FLAGS:-}")
+}
+JSON
+    st_set cpu done
+}
 
-TOTAL_RAM_GB=$(awk '/MemTotal/{printf "%.1f",$2/1048576}' /proc/meminfo)
-FREE_RAM_GB=$(awk '/MemAvailable/{printf "%.1f",$2/1048576}' /proc/meminfo)
-USED_RAM_GB=$(awk "BEGIN{printf \"%.1f\",$TOTAL_RAM_GB - $FREE_RAM_GB}")
-RAM_PCT=$(awk "BEGIN{printf \"%.0f\",($USED_RAM_GB/$TOTAL_RAM_GB)*100}" 2>/dev/null || echo "0")
+# ── Scan: RAM ─────────────────────────────────────────────────
+scan_ram() {
+    st_set ram running
+    local pfile="$TMPD/probs_ram.ndjson"
 
-RAM_MODS_JSON=""
-USED_SLOTS=0
-TOTAL_SLOTS=0
-MAX_CAPACITY=""
+    local total_kb free_kb TOTAL_GB AVAILABLE_GB
+    total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    free_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo "0")
+    TOTAL_GB=$(awk -v t="$total_kb" 'BEGIN{printf "%.1f",t/1024/1024}' 2>/dev/null || echo "0")
+    AVAILABLE_GB=$(awk -v f="$free_kb" 'BEGIN{printf "%.1f",f/1024/1024}' 2>/dev/null || echo "0")
 
-if cmd dmidecode; then
-    # Parse Memory Device blocks via temp file
-    DMI_TMP="$TMPD/dmi17.txt"
-    { dmidecode -t 17 2>/dev/null; echo "Memory Device"; } > "$DMI_TMP"
-    current_block=""
-    while IFS= read -r line; do
-        if echo "$line" | grep -q "^Memory Device$"; then
-            if [ -n "$current_block" ]; then
-                SIZE=$(echo "$current_block" | grep -m1 "Size:" | sed 's/.*Size: //' | xargs)
-                if echo "$SIZE" | grep -qE "^[0-9]+"; then
-                    SLOT=$(echo "$current_block" | grep -m1 "Locator:" | grep -v "Bank" | sed 's/.*Locator: //' | xargs)
-                    BANK=$(echo "$current_block" | grep -m1 "Bank Locator:" | sed 's/.*Bank Locator: //' | xargs)
-                    MTYPE=$(echo "$current_block" | grep -m1 "Type:" | grep -v "Error\|Correction\|Factor\|Detail" | sed 's/.*Type: //' | xargs)
-                    SPEED=$(echo "$current_block" | grep -m1 "Speed:" | grep -oP '[0-9]+' | head -1 || echo "0")
-                    CFGSPD=$(echo "$current_block" | grep -m1 "Configured.*Speed:" | grep -oP '[0-9]+' | head -1 || echo "0")
-                    MFG=$(echo "$current_block" | grep -m1 "Manufacturer:" | sed 's/.*Manufacturer: //' | xargs)
-                    PART=$(echo "$current_block" | grep -m1 "Part Number:" | sed 's/.*Part Number: //' | xargs)
-                    SERIAL_RAM=$(echo "$current_block" | grep -m1 "Serial Number:" | sed 's/.*Serial Number: //' | xargs)
-                    VOLT=$(echo "$current_block" | grep -m1 "Configured Voltage:" | grep -oP '[0-9.]+' | head -1 || echo "")
-                    FORM=$(echo "$current_block" | grep -m1 "Form Factor:" | sed 's/.*Form Factor: //' | xargs)
-                    DW=$(echo "$current_block" | grep -m1 "Data Width:" | grep -oP '[0-9]+' | head -1 || echo "64")
-                    TW=$(echo "$current_block" | grep -m1 "Total Width:" | grep -oP '[0-9]+' | head -1 || echo "64")
-                    SIZE_GB=$(echo "$SIZE" | awk '{u=substr($0,length($0)); n=substr($0,1,length($0)-2)+0; if(u=="GB")printf "%.0f",n; else if(u=="MB")printf "%.1f",n/1024; else printf "0"}')
-                    ECC=$([ "${TW:-64}" -gt "${DW:-64}" ] && echo "true" || echo "false")
-                    USED_SLOTS=$((USED_SLOTS+1))
-                    [ -n "$RAM_MODS_JSON" ] && RAM_MODS_JSON+=","
-                    RAM_MODS_JSON+="{\"slot\":$(jstr "$SLOT"),\"bank\":$(jstr "$BANK"),\"size_gb\":$(jnum "$SIZE_GB"),\"type\":$(jstr "$MTYPE"),\"form_factor\":$(jstr "$FORM"),\"speed_mhz\":$(jnum "$SPEED"),\"configured_mhz\":$(jnum "$CFGSPD"),\"manufacturer\":$(jstr "$MFG"),\"part_number\":$(jstr "$PART"),\"serial\":$(jstr "$SERIAL_RAM"),\"voltage\":$(jstr "${VOLT}V"),\"ecc\":$ECC}"
-                    log_ok "RAM: $SLOT - ${SIZE_GB}GB $MTYPE @ ${SPEED}MHz - $MFG $PART"
+    local MAX_SPEED="" CONFIG_SPEED="" XMP_AVAILABLE="false" XMP_ENABLED="false"
+    local HAS_LPDDR="false" slots="" SLOTS_JSON="[]"
+
+    if cmd dmidecode; then
+        local dmi_out
+        dmi_out=$(dmidecode -t 17 2>/dev/null || echo "")
+
+        MAX_SPEED=$(echo "$dmi_out" | grep -E '^\s+Speed:' | \
+                    grep -v 'Unknown\|No Module\|Not Specified' | \
+                    grep -oP '[0-9]+' | sort -rn | head -1 || echo "")
+        CONFIG_SPEED=$(echo "$dmi_out" | grep -iE 'Configured.*Speed:|Configured.*Clock:' | \
+                       grep -oP '[0-9]+' | head -1 || echo "")
+
+        if [ -n "${MAX_SPEED:-}" ] && [ -n "${CONFIG_SPEED:-}" ]; then
+            [ "$MAX_SPEED" -gt "$CONFIG_SPEED" ] 2>/dev/null && XMP_AVAILABLE="true"
+            [ "$MAX_SPEED" -le "$(( CONFIG_SPEED + 10 ))" ] 2>/dev/null && XMP_ENABLED="true"
+        fi
+
+        echo "$dmi_out" | grep -qiE "LPDDR|Row Of Chips" && HAS_LPDDR="true"
+
+        # Per-slot parsing via awk paragraph mode
+        while IFS= read -r block; do
+            echo "$block" | grep -q "Memory Device" || continue
+            local sz
+            sz=$(echo "$block" | grep '^\s*Size:' | head -1 | \
+                 grep -oP '[0-9]+\s*(GB|MB)' | head -1 || echo "")
+            [ -z "$sz" ] && continue
+            echo "$sz" | grep -qP '^\d' || continue
+
+            local loc typ spd cspd fff prt mfr
+            loc=$(echo "$block"  | grep '^\s*Locator:'         | grep -v 'Bank' | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+            typ=$(echo "$block"  | grep '^\s*Type:'            | grep -v 'Error\|Factor\|Detail' | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+            spd=$(echo "$block"  | grep '^\s*Speed:'           | head -1 | grep -oP '[0-9]+' | head -1 || echo "")
+            cspd=$(echo "$block" | grep -i 'Configured.*Speed:'| head -1 | grep -oP '[0-9]+' | head -1 || echo "")
+            fff=$(echo "$block"  | grep '^\s*Form Factor:'     | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+            prt=$(echo "$block"  | grep '^\s*Part Number:'     | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+            mfr=$(echo "$block"  | grep '^\s*Manufacturer:'    | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+
+            echo "${typ:-}${fff:-}" | grep -qiE "LPDDR|Row" && HAS_LPDDR="true"
+
+            slots="${slots}{\"locator\":$(jstr "${loc:-}"),\"size\":$(jstr "${sz:-}"),\"type\":$(jstr "${typ:-}"),\"speed_mhz\":$(jnum "${spd:-}"),\"configured_mhz\":$(jnum "${cspd:-}"),\"form_factor\":$(jstr "${fff:-}"),\"part\":$(jstr "${prt:-}"),\"manufacturer\":$(jstr "${mfr:-}")},"
+        done < <(echo "$dmi_out" | awk 'BEGIN{RS="\n\n";ORS="\n\n"}{print}')
+
+        SLOTS_JSON="[${slots%,}]"
+    fi
+
+    if [ "$XMP_AVAILABLE" = "true" ] && [ "$XMP_ENABLED" = "false" ]; then
+        add_problem "warning" "ram" "XMP/EXPO profile not enabled" \
+            "RAM rated at ${MAX_SPEED} MT/s but running at ${CONFIG_SPEED} MT/s" \
+            "Enable XMP or EXPO in BIOS/UEFI settings for rated performance." "$pfile"
+    fi
+
+    local summ="${TOTAL_GB}GB RAM"
+    [ -n "${MAX_SPEED:-}" ] && summ="${summ} · ${MAX_SPEED} MT/s"
+    [ "$XMP_AVAILABLE" = "true" ] && [ "$XMP_ENABLED" = "false" ] && summ="${summ} ⚠ XMP OFF"
+    [ "$HAS_LPDDR" = "true" ] && summ="${summ} · LPDDR"
+    sum_set ram "$summ"
+
+    cat > "$TMPD/json_ram.json" <<JSON
+{
+  "total_gb": $(jnum "$TOTAL_GB"),
+  "available_gb": $(jnum "$AVAILABLE_GB"),
+  "speed_mhz": $(jnum "${MAX_SPEED:-}"),
+  "configured_mhz": $(jnum "${CONFIG_SPEED:-}"),
+  "xmp_available": $(jbool "$XMP_AVAILABLE"),
+  "xmp_enabled": $(jbool "$XMP_ENABLED"),
+  "is_lpddr": $(jbool "$HAS_LPDDR"),
+  "slots": $SLOTS_JSON
+}
+JSON
+    st_set ram done
+}
+
+# ── Scan: Storage ─────────────────────────────────────────────
+scan_storage() {
+    st_set storage running
+    local pfile="$TMPD/probs_storage.ndjson"
+    local drives_json="" drive_count=0 issue_count=0
+
+    for dev in /dev/sd? /dev/nvme?n? /dev/mmcblk?; do
+        [ -b "$dev" ] || continue
+        drive_count=$((drive_count + 1))
+
+        local DTYPE SIZE_GB MODEL SERIAL SMART_HEALTH POWER_HOURS="" TEMP_C=""
+        local REALLOCATED="0" PENDING="0" UNCORRECTABLE="0"
+        local NVME_SPARE="" NVME_PCT_USED="" NVME_UNSAFE_SHUT="" NVME_POWER_CYCLES=""
+        local attrs_json=""
+
+        case "$dev" in
+            /dev/nvme*)   DTYPE="NVMe" ;;
+            /dev/mmcblk*) DTYPE="eMMC" ;;
+            *)
+                local rota
+                rota=$(cat "/sys/block/$(basename "$dev")/queue/rotational" 2>/dev/null || echo "0")
+                [ "$rota" = "1" ] && DTYPE="HDD" || DTYPE="SSD"
+                ;;
+        esac
+
+        SIZE_GB=$(lsblk -bdn -o SIZE "$dev" 2>/dev/null | \
+                  awk '{printf "%.0f",$1/1024/1024/1024}' 2>/dev/null || echo "")
+        MODEL=$(cat "/sys/block/$(basename "$dev")/device/model" 2>/dev/null | xargs 2>/dev/null || echo "")
+        SERIAL=$(cat "/sys/block/$(basename "$dev")/device/serial" 2>/dev/null | xargs 2>/dev/null || echo "")
+        SMART_HEALTH=""
+
+        if cmd smartctl; then
+            local SOUT
+            SOUT=$(smartctl -a "$dev" 2>/dev/null || echo "")
+            if [ -n "$SOUT" ]; then
+                local m; m=$(echo "$SOUT" | grep -iE '^Device Model|^Model Number' | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+                [ -n "$m" ] && MODEL="$m"
+                local ser; ser=$(echo "$SOUT" | grep -i '^Serial Number' | head -1 | cut -d: -f2 | xargs 2>/dev/null || echo "")
+                [ -n "$ser" ] && SERIAL="$ser"
+                SMART_HEALTH=$(echo "$SOUT" | grep -iE 'overall-health|SMART Health Status' | \
+                               head -1 | awk '{print $NF}' || echo "")
+
+                if [ "$DTYPE" = "NVMe" ]; then
+                    NVME_SPARE=$(echo "$SOUT"       | grep -i "Available Spare:"   | grep -oP '[0-9]+' | head -1 || echo "")
+                    NVME_PCT_USED=$(echo "$SOUT"    | grep -i "Percentage Used:"   | grep -oP '[0-9]+' | head -1 || echo "")
+                    NVME_UNSAFE_SHUT=$(echo "$SOUT" | grep -i "Unsafe Shutdowns:"  | grep -oP '[0-9]+' | head -1 || echo "")
+                    NVME_POWER_CYCLES=$(echo "$SOUT"| grep -i "Power Cycles:"      | grep -oP '[0-9]+' | head -1 || echo "")
+                    TEMP_C=$(echo "$SOUT"           | grep -iE "^Temperature:"     | grep -oP '[0-9]+' | head -1 || echo "")
+                    POWER_HOURS=$(echo "$SOUT"      | grep -i "Power On Hours:"    | grep -oP '[0-9,]+' | head -1 | tr -d ',' || echo "")
+
+                    if [ -n "${NVME_PCT_USED:-}" ] && [ "${NVME_PCT_USED:-0}" -ge 90 ] 2>/dev/null; then
+                        issue_count=$((issue_count + 1))
+                        add_problem "critical" "storage" "NVMe wear critical — $(basename "$dev")" \
+                            "Drive life used: ${NVME_PCT_USED}%" \
+                            "Backup all data immediately. Replace NVMe drive." "$pfile"
+                    elif [ -n "${NVME_PCT_USED:-}" ] && [ "${NVME_PCT_USED:-0}" -ge 70 ] 2>/dev/null; then
+                        add_problem "warning" "storage" "NVMe nearing end of life — $(basename "$dev")" \
+                            "Drive life used: ${NVME_PCT_USED}%" \
+                            "Plan for drive replacement soon." "$pfile"
+                    fi
+                    if [ -n "${NVME_SPARE:-}" ] && [ "${NVME_SPARE:-100}" -lt 10 ] 2>/dev/null; then
+                        issue_count=$((issue_count + 1))
+                        add_problem "critical" "storage" "NVMe spare space critical — $(basename "$dev")" \
+                            "Available spare: ${NVME_SPARE}% (threshold: 10%)" \
+                            "Replace drive immediately." "$pfile"
+                    fi
+                else
+                    # SATA/SSD — full attribute table with thresh field (up to 40 rows)
+                    REALLOCATED=$(echo "$SOUT" | awk '/^\s*5\s+/{print $10}' | head -1 || echo "0")
+                    PENDING=$(echo "$SOUT"     | awk '/^\s*197\s+/{print $10}' | head -1 || echo "0")
+                    UNCORRECTABLE=$(echo "$SOUT"| awk '/^\s*198\s+/{print $10}' | head -1 || echo "0")
+                    POWER_HOURS=$(echo "$SOUT"  | awk '/^\s*9\s+/{print $10}'   | head -1 | tr -d ',' || echo "")
+                    TEMP_C=$(echo "$SOUT"       | awk '/^\s*(190|194)\s+/{print $10}' | head -1 || echo "")
+
+                    while IFS= read -r row; do
+                        [ -z "$row" ] && continue
+                        local aid aname aval aw ath atype araw
+                        aid=$(echo "$row"   | awk '{print $1}')
+                        aname=$(echo "$row" | awk '{print $2}')
+                        aval=$(echo "$row"  | awk '{print $4}')
+                        aw=$(echo "$row"    | awk '{print $5}')
+                        ath=$(echo "$row"   | awk '{print $6}')
+                        atype=$(echo "$row" | awk '{print $7}')
+                        araw=$(echo "$row"  | awk '{print $10}')
+                        attrs_json="${attrs_json}{\"id\":$(jnum "$aid"),\"name\":$(jstr "$aname"),\"value\":$(jnum "$aval"),\"worst\":$(jnum "$aw"),\"thresh\":$(jnum "$ath"),\"type\":$(jstr "$atype"),\"raw\":$(jnum "$araw")},"
+                    done < <(echo "$SOUT" | grep -E '^\s+[0-9]+ [A-Za-z_]' | head -40 || true)
+
+                    if [ "${REALLOCATED:-0}" -ge 1 ] 2>/dev/null; then
+                        issue_count=$((issue_count + 1))
+                        add_problem "critical" "storage" "Drive failure imminent — $(basename "$dev")" \
+                            "${REALLOCATED} reallocated sector(s)" \
+                            "Backup all data immediately. Replace drive." "$pfile"
+                    elif [ "${PENDING:-0}" -ge 1 ] 2>/dev/null; then
+                        add_problem "warning" "storage" "Unstable sectors — $(basename "$dev")" \
+                            "${PENDING} pending sector(s) awaiting reallocation" \
+                            "Run full SMART test. Back up data." "$pfile"
+                    fi
+                fi
+
+                if echo "${SMART_HEALTH:-}" | grep -qiE "FAIL" 2>/dev/null; then
+                    issue_count=$((issue_count + 1))
+                    add_problem "critical" "storage" "SMART overall health FAILED — $(basename "$dev")" \
+                        "SMART reports: $SMART_HEALTH" \
+                        "Replace drive immediately. Back up all data now." "$pfile"
                 fi
             fi
-            current_block=""
-        else
-            current_block+="$line"$'\n'
         fi
-    done < "$DMI_TMP"
 
-    MAX_CAPACITY=$(dmidecode -t 16 2>/dev/null | grep "Maximum Capacity:" | head -1 | sed 's/.*Capacity: //' | xargs || echo "")
-    ARR_SLOTS=$(dmidecode -t 16 2>/dev/null | grep "Number Of Devices:" | grep -oP '[0-9]+' | head -1 || echo "")
-    [ -n "$ARR_SLOTS" ] && TOTAL_SLOTS=$ARR_SLOTS || TOTAL_SLOTS=$USED_SLOTS
-fi
-
-# Dual channel detection
-DUAL_CHANNEL="false"
-CHANNEL_NOTE="Cannot determine"
-if [ "$USED_SLOTS" -ge 2 ]; then
-    DUAL_CHANNEL="true"
-    CHANNEL_NOTE="Dual-channel likely active ($USED_SLOTS DIMMs installed)"
-elif [ "$USED_SLOTS" -eq 1 ]; then
-    CHANNEL_NOTE="Single-channel - add matching DIMM in slot B for dual-channel"
-    log_warn "$CHANNEL_NOTE"
-fi
-
-# XMP check
-XMP_NOTE=""
-if [ "$USED_SLOTS" -ge 1 ]; then
-    SPD=$(echo "$RAM_MODS_JSON" | grep -oP '"speed_mhz":\K[0-9]+' | head -1 || echo "0")
-    CFG=$(echo "$RAM_MODS_JSON" | grep -oP '"configured_mhz":\K[0-9]+' | head -1 || echo "0")
-    if [ "$SPD" -gt 0 ] 2>/dev/null && [ "$CFG" -gt 0 ] 2>/dev/null && [ "$CFG" -lt "$SPD" ] 2>/dev/null; then
-        XMP_NOTE="RAM at ${CFG}MHz vs rated ${SPD}MHz - enable XMP/DOCP in BIOS"
-        log_warn "$XMP_NOTE"
-    fi
-fi
-
-log_ok "Total RAM: ${TOTAL_RAM_GB}GB - Used: ${USED_RAM_GB}GB (${RAM_PCT}%)"
-
-MEMORY_JSON=$(printf '{"total_gb":%s,"used_gb":%s,"free_gb":%s,"used_pct":%s,"total_slots":%s,"used_slots":%s,"max_capacity":%s,"dual_channel":%s,"channel_note":%s,"xmp_note":%s,"modules":[%s]}' \
-    "$(jnum "$TOTAL_RAM_GB")" "$(jnum "$USED_RAM_GB")" "$(jnum "$FREE_RAM_GB")" "$(jnum "$RAM_PCT")" \
-    "$(jnum "${TOTAL_SLOTS:-$USED_SLOTS}")" "$USED_SLOTS" "$(jstr "${MAX_CAPACITY:-Unknown}")" \
-    "$DUAL_CHANNEL" "$(jstr "$CHANNEL_NOTE")" "$(jstr "$XMP_NOTE")" "$RAM_MODS_JSON")
-
-# ============================================================
-# 4. STORAGE - SMART + PARTITIONS
-# ============================================================
-log_section "STORAGE"
-
-DRIVES_JSON=""
-
-# Detect all block devices — works with or without lsblk
-get_block_devices() {
-    # Try lsblk first
-    if cmd lsblk; then
-        lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | sort
-        return
-    fi
-    # Fallback: scan /sys/block directly
-    for dev in /sys/block/*/; do
-        devname=$(basename "$dev")
-        # Skip loop, ram, sr devices
-        echo "$devname" | grep -qE '^(loop|ram|sr|fd)' && continue
-        echo "$devname"
+        drives_json="${drives_json}{\"device\":$(jstr "$dev"),\"type\":$(jstr "${DTYPE:-}"),\"model\":$(jstr "${MODEL:-}"),\"serial\":$(jstr "${SERIAL:-}"),\"size_gb\":$(jnum "${SIZE_GB:-}"),\"smart_health\":$(jstr "${SMART_HEALTH:-}"),\"temp_c\":$(jnum "${TEMP_C:-}"),\"power_hours\":$(jnum "${POWER_HOURS:-}"),\"reallocated_sectors\":$(jnum "${REALLOCATED:-0}"),\"pending_sectors\":$(jnum "${PENDING:-0}"),\"uncorrectable\":$(jnum "${UNCORRECTABLE:-0}"),\"nvme_percentage_used\":$(jnum "${NVME_PCT_USED:-}"),\"nvme_available_spare\":$(jnum "${NVME_SPARE:-}"),\"nvme_unsafe_shutdowns\":$(jnum "${NVME_UNSAFE_SHUT:-}"),\"nvme_power_cycles\":$(jnum "${NVME_POWER_CYCLES:-}"),\"smart_attrs\":[${attrs_json%,}]},"
     done
+
+    local summ="${drive_count} drive(s) found"
+    [ "$issue_count" -gt 0 ] && summ="${summ} ⚠ ${issue_count} ISSUE(S)"
+    sum_set storage "$summ"
+
+    printf '{"drives":[%s]}' "${drives_json%,}" > "$TMPD/json_storage.json"
+    st_set storage done
 }
 
-for dev in $(get_block_devices); do
-    DEV_PATH="/dev/$dev"
-    [ -b "$DEV_PATH" ] || continue
+# ── Scan: Battery ─────────────────────────────────────────────
+scan_battery() {
+    st_set battery running
+    local pfile="$TMPD/probs_battery.ndjson"
+    local bats_json="" bat_found=false
+    local last_health="" last_cap="" last_swelling="false"
 
-    # Detect if NVMe
-    IS_NVME=false
-    echo "$dev" | grep -q "^nvme" && IS_NVME=true
+    for bat_path in /sys/class/power_supply/BAT* /sys/class/power_supply/battery; do
+        [ -d "$bat_path" ] || continue
+        bat_found=true
 
-    # Get size
-    SZ_BYTES=$(cat "/sys/block/$dev/size" 2>/dev/null || echo "0")
-    SZ_GB=$(awk -v b="$SZ_BYTES" 'BEGIN{printf "%.1f",b*512/1073741824}')
+        local BNAME BSTATUS BTECH BMFR BCYCLES="" BVOLT="" BCAP="" BHEALTH=""
+        local BFULL="" BDESIGN="" BSWELLING="false"
 
-    # Get model
-    DISK_MODEL=$(cat "/sys/block/$dev/device/model" 2>/dev/null | xargs || \
-                 cat "/sys/block/$dev/device/name" 2>/dev/null | xargs || echo "Unknown")
-    DISK_VENDOR=$(cat "/sys/block/$dev/device/vendor" 2>/dev/null | xargs || echo "")
-    DISK_SERIAL=$(cat "/sys/block/$dev/device/serial" 2>/dev/null | xargs || echo "")
-    DISK_FW=$(cat "/sys/block/$dev/device/rev" 2>/dev/null | xargs || \
-              cat "/sys/block/$dev/device/firmware_rev" 2>/dev/null | xargs || echo "")
-    ROTA=$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null || echo "0")
-    MEDIA_TYPE=$([ "$IS_NVME" = "true" ] && echo "NVMe" || { [ "$ROTA" = "1" ] && echo "HDD" || echo "SSD"; })
-    TRANSPORT=$([ "$IS_NVME" = "true" ] && echo "nvme" || echo "sata")
+        BNAME=$(cat "$bat_path/name" 2>/dev/null || basename "$bat_path")
+        BSTATUS=$(cat "$bat_path/status" 2>/dev/null || echo "Unknown")
+        BTECH=$(cat "$bat_path/technology" 2>/dev/null || echo "")
+        BMFR=$(cat "$bat_path/manufacturer" 2>/dev/null || echo "")
+        BCYCLES=$(cat "$bat_path/cycle_count" 2>/dev/null || echo "")
+        BCAP=$(cat "$bat_path/capacity" 2>/dev/null || echo "")
+        BVOLT=$(cat "$bat_path/voltage_now" 2>/dev/null | \
+                awk '{printf "%.3f",$1/1000000}' 2>/dev/null || echo "")
 
-    # SMART
-    SMART_STATUS="Unknown"
-    SMART_FAILING="false"
-    SMART_HOURS="null"
-    SMART_TEMP_DISK="null"
-    SMART_REALLOCATED="null"
-    SMART_PENDING="null"
-    SMART_UNCORRECTABLE="null"
-    SMART_WEAR="null"
-    SMART_ATTRS_JSON=""
-
-    if cmd smartctl; then
-        # Use appropriate device type
-        if [ "$IS_NVME" = "true" ]; then
-            SOUT=$(smartctl -a "$DEV_PATH" 2>/dev/null || echo "")
-        else
-            SOUT=$(smartctl -a "$DEV_PATH" 2>/dev/null || \
-                   smartctl -a "$DEV_PATH" -d sat 2>/dev/null || echo "")
+        if [ -f "$bat_path/energy_full" ]; then
+            BFULL=$(awk '{printf "%.0f",$1/1000}' "$bat_path/energy_full" 2>/dev/null || echo "")
+            BDESIGN=$(awk '{printf "%.0f",$1/1000}' "$bat_path/energy_full_design" 2>/dev/null || echo "")
+        elif [ -f "$bat_path/charge_full" ]; then
+            BFULL=$(awk '{printf "%.0f",$1/1000}' "$bat_path/charge_full" 2>/dev/null || echo "")
+            BDESIGN=$(awk '{printf "%.0f",$1/1000}' "$bat_path/charge_full_design" 2>/dev/null || echo "")
         fi
 
-        if [ -n "$SOUT" ]; then
-            echo "$SOUT" | grep -q "SMART overall-health.*PASSED" && SMART_STATUS="OK" && SMART_FAILING="false"
-            echo "$SOUT" | grep -q "SMART overall-health.*FAILED" && SMART_STATUS="FAILING" && SMART_FAILING="true"
-            # NVMe health
-            echo "$SOUT" | grep -q "SMART/Health Information" && SMART_STATUS="OK"
-
-            SMART_HOURS=$(echo "$SOUT" | grep -iE "Power_On_Hours|Power On Hours" | grep -o '[0-9][0-9]*' | head -1 | tr -d '\n\r ' || echo "")
-            [ -z "$SMART_HOURS" ] && SMART_HOURS="null"
-            SMART_TEMP_DISK=$(echo "$SOUT" | grep -iE "Temperature|Composite" | grep -o '[0-9][0-9]*' | head -1 | tr -d '\n\r ' || echo "")
-            [ -z "$SMART_TEMP_DISK" ] && SMART_TEMP_DISK="null"
-            SMART_REALLOCATED=$(echo "$SOUT" | grep -i "Reallocated_Sector" | grep -o '[0-9][0-9]*' | tail -1 | tr -d '\n\r ' || echo "")
-            [ -z "$SMART_REALLOCATED" ] && SMART_REALLOCATED="null"
-            SMART_PENDING=$(echo "$SOUT" | grep -i "Current_Pending_Sector" | grep -o '[0-9][0-9]*' | tail -1 | tr -d '\n\r ' || echo "")
-            [ -z "$SMART_PENDING" ] && SMART_PENDING="null"
-            SMART_UNCORRECTABLE=$(echo "$SOUT" | grep -i "Offline_Uncorrectable" | grep -o '[0-9][0-9]*' | tail -1 | tr -d '\n\r ' || echo "")
-            [ -z "$SMART_UNCORRECTABLE" ] && SMART_UNCORRECTABLE="null"
-            SMART_WEAR=$(echo "$SOUT" | grep -iE "Wear_Leveling|Media_Wearout|Percentage Used|Available Spare" | grep -o '[0-9][0-9]*' | head -1 | tr -d '\n\r ' || echo "")
-            [ -z "$SMART_WEAR" ] && SMART_WEAR="null"
-
-            # Key SMART attributes
-            ATTR_LINES=$(echo "$SOUT" | grep -E "^[[:space:]]*[0-9]+ " | head -20 || echo "")
-            ATTR_TMP="$TMPD/smart_attrs.txt"
-            printf '%s\n' "$ATTR_LINES" > "$ATTR_TMP"
-            while IFS= read -r al; do
-                [ -z "$al" ] && continue
-                AID=$(echo "$al" | awk '{print $1}')
-                ANAME=$(echo "$al" | awk '{print $2}')
-                AVAL=$(echo "$al" | awk '{print $4}')
-                AWST=$(echo "$al" | awk '{print $5}')
-                ARAW=$(echo "$al" | awk '{print $NF}')
-                [ -n "$SMART_ATTRS_JSON" ] && SMART_ATTRS_JSON="$SMART_ATTRS_JSON,"
-                SMART_ATTRS_JSON="$SMART_ATTRS_JSON{\"id\":$(jnum "$AID"),\"name\":$(jstr "$ANAME"),\"value\":$(jnum "$AVAL"),\"worst\":$(jnum "$AWST"),\"raw\":$(jnum "$ARAW")}"
-            done < "$ATTR_TMP"
+        if [ -n "${BFULL:-}" ] && [ -n "${BDESIGN:-}" ] && [ "${BDESIGN:-0}" -gt 0 ] 2>/dev/null; then
+            BHEALTH=$(awk -v f="${BFULL}" -v d="${BDESIGN}" \
+                'BEGIN{printf "%.0f",f*100/d}' 2>/dev/null || echo "")
         fi
-    fi
 
-    # Partitions (without lsblk)
-    PARTS_JSON=""
-    for part in /sys/block/$dev/${dev}*/; do
-        [ -d "$part" ] || continue
-        PN=$(basename "$part")
-        PMT=$(grep " /dev/$PN " /proc/mounts 2>/dev/null | awk '{print $2}' || echo "")
-        [ -n "$PARTS_JSON" ] && PARTS_JSON="$PARTS_JSON,"
-        PARTS_JSON="$PARTS_JSON{\"name\":$(jstr "$PN"),\"mount\":$(jstr "$PMT"),\"filesystem\":\"\",\"label\":\"\",\"size\":\"\",\"available\":\"\"}"
+        # Swelling: reported full > 105% of design
+        if [ -n "${BFULL:-}" ] && [ -n "${BDESIGN:-}" ]; then
+            if awk -v f="${BFULL}" -v d="${BDESIGN}" 'BEGIN{exit !(f+0 > d*1.05)}' 2>/dev/null; then
+                BSWELLING="true"
+                add_problem "critical" "battery" "Battery swelling risk detected" \
+                    "Reported capacity (${BFULL} mWh) exceeds design (${BDESIGN} mWh)" \
+                    "Power off immediately. Do not charge. Replace battery — fire risk." "$pfile"
+            fi
+        fi
+
+        if [ -n "${BHEALTH:-}" ] && [ "${BHEALTH:-100}" -lt 50 ] 2>/dev/null; then
+            add_problem "warning" "battery" "Battery health critically low" \
+                "Health at ${BHEALTH}% (threshold: 50%)" \
+                "Replace battery for reliable operation." "$pfile"
+        fi
+
+        if [ -n "${BCYCLES:-}" ] && [ "${BCYCLES:-0}" -gt 1000 ] 2>/dev/null; then
+            add_problem "warning" "battery" "Battery cycle count very high" \
+                "Cycle count: ${BCYCLES} (typical max: 500-1000)" \
+                "Consider replacing battery." "$pfile"
+        fi
+
+        last_health="${BHEALTH:-}"; last_cap="${BCAP:-}"; last_swelling="$BSWELLING"
+
+        bats_json="${bats_json}{\"name\":$(jstr "${BNAME:-}"),\"status\":$(jstr "${BSTATUS:-}"),\"technology\":$(jstr "${BTECH:-}"),\"manufacturer\":$(jstr "${BMFR:-}"),\"charge_pct\":$(jnum "${BCAP:-}"),\"health_pct\":$(jnum "${BHEALTH:-}"),\"design_mwh\":$(jnum "${BDESIGN:-}"),\"full_mwh\":$(jnum "${BFULL:-}"),\"voltage_v\":$(jnum "${BVOLT:-}"),\"cycle_count\":$(jnum "${BCYCLES:-}"),\"swelling_risk\":$(jbool "${BSWELLING}")},"
     done
 
-    if [ "$SMART_FAILING" = "true" ]; then
-        log_err "DISK: $DISK_MODEL - ${SZ_GB}GB [$TRANSPORT] - SMART FAILING! BACK UP NOW"
+    local summ
+    if [ "$bat_found" = "true" ]; then
+        summ="Battery found"
+        [ -n "${last_cap:-}" ]    && summ="${summ} · ${last_cap}%"
+        [ -n "${last_health:-}" ] && summ="${summ} · health ${last_health}%"
+        [ "${last_swelling:-false}" = "true" ] && summ="${summ} ⚠ SWELLING"
     else
-        log_ok "DISK: $DISK_MODEL - ${SZ_GB}GB [$TRANSPORT] - SMART: $SMART_STATUS"
+        summ="No battery (desktop)"
+    fi
+    sum_set battery "$summ"
+
+    printf '{"batteries":[%s]}' "${bats_json%,}" > "$TMPD/json_battery.json"
+    st_set battery done
+}
+
+# ── Scan: GPU ─────────────────────────────────────────────────
+scan_gpu() {
+    st_set gpu running
+    local gpus_json="" gpu_count=0
+
+    if cmd lspci; then
+        while IFS= read -r line; do
+            local GSLOT GMODEL GDRIVER="" GREVISION="" GFW="" GVRAM="" GTEMP=""
+            GSLOT=$(echo "$line" | awk '{print $1}')
+            GMODEL=$(echo "$line" | cut -d: -f3- | xargs 2>/dev/null || echo "Unknown GPU")
+            gpu_count=$((gpu_count + 1))
+            local gidx=$((gpu_count - 1))
+
+            GDRIVER=$(lspci -k -s "$GSLOT" 2>/dev/null | grep 'Kernel driver in use:' | \
+                      cut -d: -f2 | xargs 2>/dev/null || echo "")
+            GREVISION=$(lspci -v -s "$GSLOT" 2>/dev/null | grep -i 'Revision:' | \
+                        awk '{print $NF}' | head -1 || echo "")
+            GFW=$(cat "/sys/class/drm/card${gidx}/device/fw_version" 2>/dev/null || echo "")
+
+            local vram_file="/sys/class/drm/card${gidx}/device/mem_info_vram_total"
+            [ -f "$vram_file" ] && GVRAM=$(awk '{printf "%.0f",$1/1024/1024}' "$vram_file" 2>/dev/null || echo "")
+
+            local hwmon hname
+            for hwmon in /sys/class/hwmon/hwmon*/; do
+                [ -d "$hwmon" ] || continue
+                hname=$(cat "${hwmon}name" 2>/dev/null || echo "")
+                echo "$hname" | grep -qiE "amdgpu|radeon|nouveau|nvidia" || continue
+                local tf="${hwmon}temp1_input"
+                [ -f "$tf" ] && GTEMP=$(awk '{printf "%.0f",$1/1000}' "$tf" 2>/dev/null || echo "")
+                break
+            done
+
+            gpus_json="${gpus_json}{\"slot\":$(jstr "${GSLOT:-}"),\"model\":$(jstr "${GMODEL:-}"),\"driver\":$(jstr "${GDRIVER:-}"),\"revision\":$(jstr "${GREVISION:-}"),\"firmware\":$(jstr "${GFW:-}"),\"vram_mb\":$(jnum "${GVRAM:-}"),\"temp_c\":$(jnum "${GTEMP:-}")},"
+        done < <(lspci 2>/dev/null | grep -iE 'VGA compatible|3D controller|Display controller' || true)
     fi
 
-    [ -n "$DRIVES_JSON" ] && DRIVES_JSON="$DRIVES_JSON,"
-    DRIVES_JSON="$DRIVES_JSON$(printf '{"device":%s,"model":%s,"vendor":%s,"serial":%s,"firmware":%s,"transport":%s,"media_type":%s,"size_gb":%s,"smart_status":%s,"smart_failing":%s,"smart_power_on_hours":%s,"smart_temp_celsius":%s,"smart_reallocated":%s,"smart_pending":%s,"smart_uncorrectable":%s,"smart_wear_level":%s,"smart_attributes":[%s],"partitions":[%s]}' \
-        "$(jstr "$DEV_PATH")" "$(jstr "$DISK_MODEL")" "$(jstr "$DISK_VENDOR")" "$(jstr "$DISK_SERIAL")" \
-        "$(jstr "$DISK_FW")" "$(jstr "$TRANSPORT")" "$(jstr "$MEDIA_TYPE")" "$(jnum "$SZ_GB")" \
-        "$(jstr "$SMART_STATUS")" "$SMART_FAILING" "${SMART_HOURS:-null}" "${SMART_TEMP_DISK:-null}" \
-        "${SMART_REALLOCATED:-null}" "${SMART_PENDING:-null}" "${SMART_UNCORRECTABLE:-null}" "${SMART_WEAR:-null}" \
-        "$SMART_ATTRS_JSON" "$PARTS_JSON")"
-done
+    sum_set gpu "${gpu_count} GPU(s)"
+    printf '{"gpus":[%s]}' "${gpus_json%,}" > "$TMPD/json_gpu.json"
+    st_set gpu done
+}
 
-STORAGE_JSON="{\"drives\":[${DRIVES_JSON}]}"
+# ── Scan: Network ─────────────────────────────────────────────
+scan_network() {
+    st_set network running
+    local ifaces_json="" iface_count=0
 
-# ============================================================
-# 5. GPU
-# ============================================================
-log_section "GPU"
+    for ipath in /sys/class/net/*/; do
+        local IFACE; IFACE=$(basename "$ipath")
+        echo "$IFACE" | grep -qE '^(lo|dummy|virbr|docker|veth|br-|bond|sit|tun|tap)' && continue
+        iface_count=$((iface_count + 1))
 
-GPU_JSON=""
+        local ITYPE="" IMAC="" ISPEED="" ISTATUS="" IS_WLAN="false"
+        local ICHAN="" IFREQ="" ISIG="" ISSID="" ICARRIER="0" IDUPLEX="" IDRIVER=""
 
-if cmd lspci; then
-    lspci 2>/dev/null | grep -iE "VGA|3D controller|Display" > "$TMPD/gpus.txt" || true
-    while IFS= read -r line; do
-        GSLOT=$(echo "$line" | cut -d' ' -f1)
-        GNAME=$(echo "$line" | sed 's/^[^ ]* [^:]*: //')
-        GVENDOR=$(echo "$GNAME" | awk '{print $1}')
-        IS_IGPU="false"
-        echo "$GNAME" | grep -qiE "Intel|UHD|HD Graphics|Vega|Radeon Graphics" && IS_IGPU="true"
+        IMAC=$(cat "${ipath}address" 2>/dev/null || echo "")
+        ISTATUS=$(cat "${ipath}operstate" 2>/dev/null || echo "unknown")
+        ICARRIER=$(cat "${ipath}carrier" 2>/dev/null || echo "0")
+        ISPEED=$(cat "${ipath}speed" 2>/dev/null || echo "")
+        IDUPLEX=$(cat "${ipath}duplex" 2>/dev/null || echo "")
+        IDRIVER=$(readlink -f "${ipath}device/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "")
 
-        GPCIID=$(lspci -n -s "$GSLOT" 2>/dev/null | awk '{print $3}' || echo "")
-        GDRIVER=$(lspci -v -s "$GSLOT" 2>/dev/null | grep "Kernel driver" | sed 's/.*: //' | xargs || echo "")
-        GSUBSYS=$(lspci -v -s "$GSLOT" 2>/dev/null | grep "Subsystem:" | sed 's/.*Subsystem: //' | xargs || echo "")
+        if [ -d "${ipath}wireless" ] || echo "$IFACE" | grep -qE '^(wl|wlan|wlp|ath|ra[0-9])'; then
+            IS_WLAN="true"; ITYPE="WiFi"
+            if cmd iw; then
+                local iw_out
+                iw_out=$(iw dev "$IFACE" link 2>/dev/null || iw dev "$IFACE" info 2>/dev/null || echo "")
+                ICHAN=$(echo "$iw_out"  | grep -oP '(?<=channel )[0-9]+' | head -1 || echo "")
+                IFREQ=$(echo "$iw_out"  | grep -oP '[0-9]+\.[0-9]+ GHz' | head -1 || echo "")
+                ISIG=$(echo "$iw_out"   | grep -oP '(?<=signal: )-?[0-9]+' | head -1 || echo "")
+                ISSID=$(echo "$iw_out"  | grep -oP '(?<=SSID: ).+' | head -1 | xargs 2>/dev/null || echo "")
+            fi
+            if cmd iwconfig && [ -z "${ISIG:-}" ]; then
+                local iwc_out
+                iwc_out=$(iwconfig "$IFACE" 2>/dev/null || echo "")
+                ISIG=$(echo "$iwc_out" | grep -oP '(?<=Signal level=)-?[0-9]+' | head -1 || echo "")
+                [ -z "${ISSID:-}" ] && ISSID=$(echo "$iwc_out" | grep -oP '(?<=ESSID:")[^"]+' | head -1 || echo "")
+            fi
+        elif echo "$IFACE" | grep -qE '^usb'; then
+            ITYPE="USB-Ethernet"
+        elif echo "$IFACE" | grep -qE '^(eth|enp|ens|eno|em)'; then
+            ITYPE="Ethernet"
+        else
+            ITYPE="Unknown"
+        fi
 
-        # VRAM
-        GVRAM="null"
-        for dm in /sys/class/drm/card*/; do
-            vmf="${dm}device/mem_info_vram_total"
-            [ -f "$vmf" ] || continue
-            vb=$(cat "$vmf" 2>/dev/null || echo "0")
-            [ "$vb" -gt 0 ] 2>/dev/null && GVRAM=$(awk -v b="$vb" 'BEGIN{printf "%.0f",b/1048576}') && break
+        ifaces_json="${ifaces_json}{\"interface\":$(jstr "${IFACE:-}"),\"type\":$(jstr "${ITYPE:-}"),\"mac\":$(jstr "${IMAC:-}"),\"status\":$(jstr "${ISTATUS:-}"),\"carrier\":$(jnum "${ICARRIER:-0}"),\"speed_mbps\":$(jnum "${ISPEED:-}"),\"duplex\":$(jstr "${IDUPLEX:-}"),\"driver\":$(jstr "${IDRIVER:-}"),\"wifi_ssid\":$(jstr "${ISSID:-}"),\"wifi_channel\":$(jnum "${ICHAN:-}"),\"wifi_freq_ghz\":$(jstr "${IFREQ:-}"),\"wifi_signal_dbm\":$(jnum "${ISIG:-}")},"
+    done
+
+    sum_set network "${iface_count} interface(s)"
+    printf '{"interfaces":[%s]}' "${ifaces_json%,}" > "$TMPD/json_network.json"
+    st_set network done
+}
+
+# ── Scan: Thermals ────────────────────────────────────────────
+scan_thermals() {
+    st_set thermals running
+    local pfile="$TMPD/probs_thermals.ndjson"
+    local sensors_json="" fans_json="" fan_stopped=0 fan_total=0
+
+    for hwmon in /sys/class/hwmon/hwmon*/; do
+        [ -d "$hwmon" ] || continue
+        local HNAME; HNAME=$(cat "${hwmon}name" 2>/dev/null || echo "unknown")
+
+        for tf in "${hwmon}"temp*_input; do
+            [ -f "$tf" ] || continue
+            local lbl tc crit_c
+            lbl=$(cat "${tf/_input/_label}" 2>/dev/null || echo "$HNAME")
+            tc=$(awk '{printf "%.1f",$1/1000}' "$tf" 2>/dev/null || echo "")
+            crit_c=$(awk '{printf "%.1f",$1/1000}' "${tf/_input/_crit}" 2>/dev/null || echo "")
+            [ -z "$tc" ] && continue
+            sensors_json="${sensors_json}{\"hwmon\":$(jstr "${HNAME:-}"),\"label\":$(jstr "${lbl:-}"),\"temp_c\":$(jnum "${tc:-}"),\"crit_c\":$(jnum "${crit_c:-}")},"
         done
 
-        # GPU temp
-        GTEMP="null"
-        for hwm in /sys/class/hwmon/hwmon*/; do
-            hn=$(cat "${hwm}name" 2>/dev/null || echo "")
-            echo "$hn" | grep -qiE "amdgpu|nvidia|radeon" || continue
-            for tf in "${hwm}"temp*_input; do
+        for ff in "${hwmon}"fan*_input; do
+            [ -f "$ff" ] || continue
+            fan_total=$((fan_total + 1))
+            local flbl frpm fmin
+            flbl=$(cat "${ff/_input/_label}" 2>/dev/null || echo "fan")
+            frpm=$(cat "$ff" 2>/dev/null || echo "")
+            fmin=$(cat "${ff/_input/_min}" 2>/dev/null || echo "")
+            fans_json="${fans_json}{\"hwmon\":$(jstr "${HNAME:-}"),\"label\":$(jstr "${flbl:-}"),\"rpm\":$(jnum "${frpm:-}"),\"min_rpm\":$(jnum "${fmin:-}")},"
+
+            if [ "${frpm:-1}" = "0" ] || \
+               { [ -n "${frpm:-}" ] && [ "${frpm}" -eq 0 ] 2>/dev/null; }; then
+                fan_stopped=$((fan_stopped + 1))
+                add_problem "critical" "thermals" "Fan not spinning — ${HNAME}/${flbl}" \
+                    "Fan RPM reads 0 while system is running" \
+                    "Check fan connector, clear obstructions, or replace fan." "$pfile"
+            fi
+        done
+    done
+
+    local summ
+    if [ "$fan_total" -eq 0 ]; then summ="No fans detected"
+    elif [ "$fan_stopped" -gt 0 ]; then summ="${fan_stopped}/${fan_total} fan(s) STOPPED ⚠"
+    else summ="All ${fan_total} fan(s) OK"; fi
+    sum_set thermals "$summ"
+
+    cat > "$TMPD/json_thermals.json" <<JSON
+{
+  "sensors": [${sensors_json%,}],
+  "fans": [${fans_json%,}],
+  "fan_count": $(jnum "$fan_total"),
+  "fans_stopped": $(jnum "$fan_stopped")
+}
+JSON
+    st_set thermals done
+}
+
+# ── Scan: Audio ───────────────────────────────────────────────
+scan_audio() {
+    st_set audio running
+    local cards_json="" card_count=0
+
+    for card in /proc/asound/card*/; do
+        [ -d "$card" ] || continue
+        card_count=$((card_count + 1))
+        local cname cinfo
+        cname=$(cat "${card}id" 2>/dev/null | xargs 2>/dev/null || basename "$card")
+        cinfo=$(cat "${card}codec#0" 2>/dev/null | grep -m1 'Codec:' | cut -d: -f2 | xargs 2>/dev/null || echo "")
+        cards_json="${cards_json}{\"card\":$(jstr "$(basename "$card")"),\"name\":$(jstr "${cname:-}"),\"codec\":$(jstr "${cinfo:-}")},"
+    done
+
+    if [ "$card_count" -eq 0 ] && cmd lspci; then
+        while IFS= read -r line; do
+            local aname; aname=$(echo "$line" | cut -d: -f3- | xargs 2>/dev/null || echo "")
+            card_count=$((card_count + 1))
+            cards_json="${cards_json}{\"card\":\"pci\",\"name\":$(jstr "${aname:-}"),\"codec\":\"\"},"
+        done < <(lspci 2>/dev/null | grep -iE 'Audio|Sound|Multimedia' || true)
+    fi
+
+    sum_set audio "${card_count} audio card(s)"
+    printf '{"cards":[%s]}' "${cards_json%,}" > "$TMPD/json_audio.json"
+    st_set audio done
+}
+
+# ── Scan: USB ─────────────────────────────────────────────────
+scan_usb() {
+    st_set usb running
+    local devs_json="" dev_count=0
+
+    if cmd lsusb; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            local vid pid name
+            vid=$(echo "$line"  | grep -oP 'ID \K[0-9a-f]{4}' | head -1 || echo "")
+            pid=$(echo "$line"  | grep -oP 'ID [0-9a-f]{4}:\K[0-9a-f]{4}' | head -1 || echo "")
+            name=$(echo "$line" | cut -d' ' -f7- | xargs 2>/dev/null || echo "")
+            dev_count=$((dev_count + 1))
+            devs_json="${devs_json}{\"vid\":$(jstr "${vid:-}"),\"pid\":$(jstr "${pid:-}"),\"name\":$(jstr "${name:-}")},"
+        done < <(lsusb 2>/dev/null | grep -v 'Linux Foundation' || true)
+    fi
+
+    sum_set usb "${dev_count} USB device(s)"
+    printf '{"devices":[%s]}' "${devs_json%,}" > "$TMPD/json_usb.json"
+    st_set usb done
+}
+
+# ── Scan: OS ──────────────────────────────────────────────────
+scan_os() {
+    st_set os running
+    local OS_NAME="" KERNEL="" UPTIME_S="" BIOS_VER="" BIOS_DATE=""
+
+    OS_NAME=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-}" || \
+              cat /etc/alpine-release 2>/dev/null | head -1 || echo "Unknown")
+    KERNEL=$(uname -r 2>/dev/null || echo "")
+    UPTIME_S=$(awk '{printf "%.0f",$1}' /proc/uptime 2>/dev/null || echo "")
+
+    if cmd dmidecode; then
+        BIOS_VER=$(dmidecode -s bios-version      2>/dev/null | head -1 | xargs 2>/dev/null || echo "")
+        BIOS_DATE=$(dmidecode -s bios-release-date 2>/dev/null | head -1 | xargs 2>/dev/null || echo "")
+    fi
+    [ -z "${BIOS_VER:-}" ]  && BIOS_VER=$(cat /sys/class/dmi/id/bios_version 2>/dev/null | xargs 2>/dev/null || echo "")
+    [ -z "${BIOS_DATE:-}" ] && BIOS_DATE=$(cat /sys/class/dmi/id/bios_date   2>/dev/null | xargs 2>/dev/null || echo "")
+
+    sum_set os "${OS_NAME:-Unknown} · ${KERNEL:-?}"
+    cat > "$TMPD/json_os.json" <<JSON
+{
+  "name": $(jstr "${OS_NAME:-}"),
+  "kernel": $(jstr "${KERNEL:-}"),
+  "uptime_s": $(jnum "${UPTIME_S:-}"),
+  "bios_version": $(jstr "${BIOS_VER:-}"),
+  "bios_date": $(jstr "${BIOS_DATE:-}")
+}
+JSON
+    st_set os done
+}
+
+# ── Scan: Security ────────────────────────────────────────────
+scan_security() {
+    st_set security running
+    local SB_STATUS="" TPM_VER="none" IOMMU_ENABLED="false"
+
+    local sb_efi="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    if [ -f "$sb_efi" ]; then
+        local sb_val
+        sb_val=$(od -An -tu1 "$sb_efi" 2>/dev/null | awk '{print $NF}' || echo "0")
+        [ "${sb_val:-0}" = "1" ] && SB_STATUS="enabled" || SB_STATUS="disabled"
+    elif [ -d /sys/firmware/efi ]; then
+        SB_STATUS="disabled"
+    else
+        SB_STATUS="legacy_bios"
+    fi
+
+    if [ -d /sys/class/tpm/tpm0 ]; then
+        local tpm_maj
+        tpm_maj=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo "1")
+        TPM_VER="TPM ${tpm_maj}.x"
+    fi
+
+    dmesg 2>/dev/null | grep -qiE 'DMAR|AMD-Vi|IOMMU' 2>/dev/null && IOMMU_ENABLED="true" || true
+
+    sum_set security "SecureBoot:${SB_STATUS:-?} TPM:${TPM_VER}"
+    cat > "$TMPD/json_security.json" <<JSON
+{
+  "secure_boot": $(jstr "${SB_STATUS:-}"),
+  "tpm": $(jstr "${TPM_VER:-none}"),
+  "iommu": $(jbool "${IOMMU_ENABLED}")
+}
+JSON
+    st_set security done
+}
+
+# ── Form factor derivation ────────────────────────────────────
+get_form_factor() {
+    local chassis
+    chassis=$(cat "$TMPD/machine_chassis" 2>/dev/null || echo "")
+    case "$chassis" in
+        [Nn]ote*|[Ll]apt*|[Ss]ub*|[Tt]ablet|notebook|laptop|9|10|14|30|31|32) echo "laptop" ;;
+        [Dd]esktop|[Tt]ower*|[Mm]ini*|[Ss]erver*|3|4|5|6|7|16|17|18|19)       echo "desktop" ;;
+        [Aa]ll*[Ii]n*[Oo]ne|[Aa][Ii][Oo])                                       echo "aio" ;;
+        *)                                                                        echo "unknown" ;;
+    esac
+}
+
+# ── Health score ──────────────────────────────────────────────
+calc_health() {
+    local score=100 crit=0 warn=0 pfile
+    for pfile in "$TMPD"/probs_*.ndjson; do
+        [ -f "$pfile" ] || continue
+        local c w
+        c=$(grep -c '"severity":"critical"' "$pfile" 2>/dev/null || echo "0")
+        w=$(grep -c '"severity":"warning"'  "$pfile" 2>/dev/null || echo "0")
+        crit=$((crit + c)); warn=$((warn + w))
+    done
+    score=$((100 - crit * 20 - warn * 7))
+    [ "$score" -lt 0 ] && score=0
+    local label
+    if   [ "$score" -ge 90 ]; then label="EXCELLENT"
+    elif [ "$score" -ge 75 ]; then label="GOOD"
+    elif [ "$score" -ge 55 ]; then label="FAIR"
+    elif [ "$score" -ge 30 ]; then label="POOR"
+    else                            label="CRITICAL"; fi
+    printf '%d %s %d %d' "$score" "$label" "$((crit + warn))" "$crit"
+}
+
+# ── Assemble final JSON ───────────────────────────────────────
+assemble_json() {
+    local SCAN_DURATION=$(( SECONDS - SCAN_START ))
+    local vendor model form_factor
+    vendor=$(cat "$TMPD/machine_vendor" 2>/dev/null || echo "")
+    model=$(cat "$TMPD/machine_model" 2>/dev/null || echo "")
+    form_factor=$(get_form_factor)
+
+    local health_info health_score health_label issues_count
+    health_info=$(calc_health)
+    health_score=$(echo "$health_info" | awk '{print $1}')
+    health_label=$(echo "$health_info" | awk '{print $2}')
+    issues_count=$(echo "$health_info" | awk '{print $3}')
+
+    local ALL_PROBS="" pfile line
+    for pfile in "$TMPD"/probs_*.ndjson; do
+        [ -f "$pfile" ] || continue
+        while IFS= read -r line; do
+            [ -n "$line" ] && ALL_PROBS="${ALL_PROBS}${line},"
+        done < "$pfile"
+    done
+    ALL_PROBS="${ALL_PROBS%,}"
+
+    local J_CPU J_RAM J_STORAGE J_BATTERY J_GPU J_NETWORK J_THERMALS
+    local J_AUDIO J_USB J_OS J_SECURITY J_MACHINE
+    J_CPU=$(cat "$TMPD/json_cpu.json"      2>/dev/null || echo 'null')
+    J_RAM=$(cat "$TMPD/json_ram.json"      2>/dev/null || echo 'null')
+    J_STORAGE=$(cat "$TMPD/json_storage.json"   2>/dev/null || echo 'null')
+    J_BATTERY=$(cat "$TMPD/json_battery.json"   2>/dev/null || echo 'null')
+    J_GPU=$(cat "$TMPD/json_gpu.json"      2>/dev/null || echo 'null')
+    J_NETWORK=$(cat "$TMPD/json_network.json"   2>/dev/null || echo 'null')
+    J_THERMALS=$(cat "$TMPD/json_thermals.json" 2>/dev/null || echo 'null')
+    J_AUDIO=$(cat "$TMPD/json_audio.json"  2>/dev/null || echo 'null')
+    J_USB=$(cat "$TMPD/json_usb.json"      2>/dev/null || echo 'null')
+    J_OS=$(cat "$TMPD/json_os.json"        2>/dev/null || echo 'null')
+    J_SECURITY=$(cat "$TMPD/json_security.json" 2>/dev/null || echo 'null')
+    J_MACHINE=$(cat "$TMPD/json_machine.json"   2>/dev/null || echo 'null')
+
+    cat > "$OUTPUT_FILE" <<JSON
+{
+  "platine_version": $(jstr "$PLATINE_VERSION"),
+  "scan_id": $(jstr "$SCAN_ID"),
+  "scanned_at": $(jstr "$SCANNED_AT"),
+  "scan_duration_s": $(jnum "$SCAN_DURATION"),
+  "health_score": $(jnum "$health_score"),
+  "health_label": $(jstr "$health_label"),
+  "issues_count": $(jnum "$issues_count"),
+  "vendor": $(jstr "$vendor"),
+  "model": $(jstr "$model"),
+  "form_factor": $(jstr "$form_factor"),
+  "machine": $J_MACHINE,
+  "cpu": $J_CPU,
+  "ram": $J_RAM,
+  "storage": $J_STORAGE,
+  "battery": $J_BATTERY,
+  "gpu": $J_GPU,
+  "network": $J_NETWORK,
+  "thermals": $J_THERMALS,
+  "audio": $J_AUDIO,
+  "usb": $J_USB,
+  "os": $J_OS,
+  "security": $J_SECURITY,
+  "problems": [${ALL_PROBS}]
+}
+JSON
+
+    if cmd python3; then
+        python3 - "$OUTPUT_FILE" <<'PYEOF' 2>/dev/null || true
+import json, re, sys
+p = sys.argv[1]
+with open(p) as f: c = f.read()
+c = re.sub(r',(\s*[}\]])', r'\1', c)
+try:
+    data = json.loads(c)
+    with open(p, 'w') as f: json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
+except Exception: pass
+PYEOF
+    fi
+}
+
+# ── Upload ────────────────────────────────────────────────────
+upload_scan() {
+    [ -f "$OUTPUT_FILE" ] || return 1
+    local response
+    response=$(curl -sf -m 30 -X POST "${PLATINE_API}/start" \
+        -H "Content-Type: application/json" -d "@${OUTPUT_FILE}" 2>/dev/null) || return 1
+
+    local SESSION_ID LIVE_URL
+    SESSION_ID=$(echo "$response" | grep -oP '"session_id"\s*:\s*"\K[^"]+' || echo "")
+    LIVE_URL=$(echo "$response"   | grep -oP '"live_url"\s*:\s*"\K[^"]+' || echo "")
+    [ -z "${SESSION_ID:-}" ] && return 1
+
+    printf '%s' "$SESSION_ID" > "$TMPD/session_id"
+    printf '%s' "$LIVE_URL"   > "$TMPD/live_url"
+    return 0
+}
+
+# ── QR code display ───────────────────────────────────────────
+show_qr() {
+    local url="${1:-}"
+    { [ -z "$url" ] || [ "$SILENT" = true ]; } && return
+    printf "\n  ${W}Scan with your phone:${N}\n"
+    printf "  ${C}%s${N}\n\n" "$url"
+    cmd qrencode && qrencode -t ANSIUTF8 -m 2 "$url" 2>/dev/null || true
+}
+
+# ── Live monitoring loop ──────────────────────────────────────
+live_loop() {
+    local SESSION_ID; SESSION_ID=$(cat "$TMPD/session_id" 2>/dev/null || echo "")
+    [ -z "${SESSION_ID:-}" ] && return
+
+    local LIVE_URL; LIVE_URL=$(cat "$TMPD/live_url" 2>/dev/null || echo "")
+    [ "$SILENT" = false ] && {
+        printf "${W}  ─────────────────────────────────────────────────────${N}\n"
+        printf "  ${G}Live monitoring active — updates every 5s${N}\n"
+        show_qr "$LIVE_URL"
+    }
+
+    local FAIL_COUNT=0
+    while true; do
+        sleep 5
+
+        local CPU_TEMP="" hwmon hname tf lbl
+        for hwmon in /sys/class/hwmon/hwmon*/; do
+            [ -d "$hwmon" ] || continue
+            hname=$(cat "${hwmon}name" 2>/dev/null || echo "")
+            echo "$hname" | grep -qiE "coretemp|k10temp|zenpower" || continue
+            for tf in "${hwmon}"temp*_input; do
                 [ -f "$tf" ] || continue
-                tr=$(cat "$tf" 2>/dev/null || echo "0")
-                GTEMP=$(awk -v r="$tr" 'BEGIN{printf "%.1f",r/1000}')
+                lbl=$(cat "${tf/_input/_label}" 2>/dev/null || echo "")
+                echo "$lbl" | grep -qiE "Package|Tdie|^CPU$" || continue
+                CPU_TEMP=$(awk '{printf "%.1f",$1/1000}' "$tf" 2>/dev/null || echo "")
                 break 2
             done
         done
 
-        # GPU load (amdgpu)
-        GLOAD="null"
-        for gb in /sys/class/drm/card*/device/gpu_busy_percent; do
-            [ -f "$gb" ] && GLOAD=$(cat "$gb" 2>/dev/null || echo "null") && break
-        done
+        local i1 t1 i2 t2 CPU_LOAD
+        i1=$(awk '/^cpu /{idle=$6; for(i=2;i<=NF;i++) t+=$i; print idle}' /proc/stat 2>/dev/null || echo "0")
+        t1=$(awk '/^cpu /{for(i=2;i<=NF;i++) t+=$i; print t}' /proc/stat 2>/dev/null || echo "1")
+        sleep 0.3
+        i2=$(awk '/^cpu /{idle=$6; for(i=2;i<=NF;i++) t+=$i; print idle}' /proc/stat 2>/dev/null || echo "0")
+        t2=$(awk '/^cpu /{for(i=2;i<=NF;i++) t+=$i; print t}' /proc/stat 2>/dev/null || echo "1")
+        CPU_LOAD=$(awk -v i1="${i1:-0}" -v t1="${t1:-1}" -v i2="${i2:-0}" -v t2="${t2:-1}" \
+            'BEGIN{dt=t2-t1; di=i2-i1; if(dt>0) printf "%.0f",(1-di/dt)*100; else print 0}' \
+            2>/dev/null || echo "0")
 
-        log_ok "GPU: $GNAME - VRAM: ${GVRAM}MB - Driver: $GDRIVER"
+        local RAM_FREE_GB
+        RAM_FREE_GB=$(awk '/^MemAvailable:/{printf "%.1f",$2/1024/1024}' /proc/meminfo 2>/dev/null || echo "")
 
-        [ -n "$GPU_JSON" ] && GPU_JSON+=","
-        GPU_JSON+=$(printf '{"name":%s,"vendor":%s,"pci_slot":%s,"pci_id":%s,"subsystem":%s,"driver":%s,"vram_mb":%s,"temp_celsius":%s,"gpu_load_pct":%s,"is_integrated":%s}' \
-            "$(jstr "$GNAME")" "$(jstr "$GVENDOR")" "$(jstr "$GSLOT")" "$(jstr "$GPCIID")" \
-            "$(jstr "$GSUBSYS")" "$(jstr "$GDRIVER")" "$GVRAM" "$GTEMP" "$GLOAD" "$IS_IGPU")
-    done < "$TMPD/gpus.txt"
-fi
+        local patch now
+        now=$(date '+%Y-%m-%dT%H:%M:%S')
+        patch=$(printf '{"session_id":%s,"cpu_load":%s,"cpu_temp_c":%s,"ram_free_gb":%s,"updated_at":%s}' \
+            "$(jstr "$SESSION_ID")" "$(jnum "${CPU_LOAD:-0}")" \
+            "$(jnum "${CPU_TEMP:-}")" "$(jnum "${RAM_FREE_GB:-}")" "$(jstr "$now")")
 
-GPU_JSON="[${GPU_JSON}]"
+        if curl -sf -m 8 -X POST "${PLATINE_API}/update" \
+            -H "Content-Type: application/json" -d "$patch" >/dev/null 2>&1; then
+            FAIL_COUNT=0
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            local backoff; backoff=$(( FAIL_COUNT < 7 ? FAIL_COUNT * 5 : 30 ))
+            sleep "$backoff"
+        fi
+    done
+}
 
-# ============================================================
-# 6. BATTERY
-# ============================================================
-log_section "BATTERY"
+# ── Main ──────────────────────────────────────────────────────
+main() {
+    scan_machine
 
-BAT_JSON=""
-IS_LAPTOP="false"
-POWER_SOURCE="Unknown"
+    scan_cpu      > "$TMPD/log_cpu.txt"      2>&1 & CPU_PID=$!
+    scan_ram      > "$TMPD/log_ram.txt"      2>&1 & RAM_PID=$!
+    scan_storage  > "$TMPD/log_storage.txt"  2>&1 & STO_PID=$!
+    scan_battery  > "$TMPD/log_battery.txt"  2>&1 & BAT_PID=$!
+    scan_gpu      > "$TMPD/log_gpu.txt"      2>&1 & GPU_PID=$!
+    scan_network  > "$TMPD/log_network.txt"  2>&1 & NET_PID=$!
+    scan_thermals > "$TMPD/log_thermals.txt" 2>&1 & THE_PID=$!
+    scan_audio    > "$TMPD/log_audio.txt"    2>&1 & AUD_PID=$!
+    scan_usb      > "$TMPD/log_usb.txt"      2>&1 & USB_PID=$!
+    scan_os       > "$TMPD/log_os.txt"       2>&1 & OS_PID=$!
+    scan_security > "$TMPD/log_security.txt" 2>&1 & SEC_PID=$!
 
-# AC status
-[ -f /sys/class/power_supply/AC/online ] && \
-    ([ "$(cat /sys/class/power_supply/AC/online 2>/dev/null)" = "1" ] && POWER_SOURCE="AC Adapter" || POWER_SOURCE="Battery")
+    while kill -0 $CPU_PID $RAM_PID $STO_PID $BAT_PID $GPU_PID $NET_PID $THE_PID 2>/dev/null; do
+        render_ui; sleep 0.5
+    done
+    wait $CPU_PID $RAM_PID $STO_PID $BAT_PID $GPU_PID $NET_PID $THE_PID \
+         $AUD_PID $USB_PID $OS_PID $SEC_PID 2>/dev/null || true
+    render_ui
 
-for batdir in /sys/class/power_supply/BAT*; do
-    [ -d "$batdir" ] || continue
-    IS_LAPTOP="true"
-    BNAME=$(basename "$batdir")
-    BSTATUS=$(cat "$batdir/status"    2>/dev/null || echo "Unknown")
-    BCAP=$(cat "$batdir/capacity"     2>/dev/null || echo "0")
-    BDESIGN=$(cat "$batdir/energy_full_design" 2>/dev/null || cat "$batdir/charge_full_design" 2>/dev/null || echo "0")
-    BFULL=$(cat "$batdir/energy_full"  2>/dev/null || cat "$batdir/charge_full" 2>/dev/null  || echo "0")
-    BVOLT=$(cat "$batdir/voltage_now"  2>/dev/null || echo "0")
-    BMANUF=$(cat "$batdir/manufacturer" 2>/dev/null || echo "")
-    BMODEL=$(cat "$batdir/model_name"   2>/dev/null || echo "")
-    BSERIAL=$(cat "$batdir/serial_number" 2>/dev/null || echo "")
-    BTECH=$(cat "$batdir/technology"    2>/dev/null || echo "")
-    BCYCLES=$(cat "$batdir/cycle_count" 2>/dev/null || echo "null")
-    BPOW=$(cat "$batdir/power_now" 2>/dev/null || cat "$batdir/current_now" 2>/dev/null || echo "0")
+    assemble_json
 
-    BHEALTH="null"
-    BDESIGN_WH="0"
-    BFULL_WH="0"
-    BVOLT_V="0"
-    BPOW_W="0"
+    local SCAN_DURATION=$(( SECONDS - SCAN_START ))
+    local health_score health_label
+    health_score=$(grep -oP '"health_score":\K[0-9]+' "$OUTPUT_FILE" 2>/dev/null | head -1 || echo "?")
+    health_label=$(grep -oP '"health_label":"\K[^"]+' "$OUTPUT_FILE" 2>/dev/null | head -1 || echo "?")
 
-    if [ "$BDESIGN" -gt 0 ] 2>/dev/null && [ "$BFULL" -gt 0 ] 2>/dev/null; then
-        BHEALTH=$(awk -v f="$BFULL" -v d="$BDESIGN" 'BEGIN{printf "%.0f",(f/d)*100}')
-        BDESIGN_WH=$(awk -v v="$BDESIGN" 'BEGIN{printf "%.2f",v/1000000}')
-        BFULL_WH=$(awk -v v="$BFULL" 'BEGIN{printf "%.2f",v/1000000}')
-    fi
-    [ "$BVOLT" -gt 0 ] 2>/dev/null && BVOLT_V=$(awk -v v="$BVOLT" 'BEGIN{printf "%.3f",v/1000000}')
-    [ "$BPOW"  -gt 0 ] 2>/dev/null && BPOW_W=$(awk -v v="$BPOW" 'BEGIN{printf "%.2f",v/1000000}')
+    [ "$SILENT" = false ] && {
+        printf "\n${G}  Scan complete in %ds${N}\n" "$SCAN_DURATION"
+        printf "  JSON: ${W}%s${N}\n" "$OUTPUT_FILE"
+        printf "\n  Health: ${W}%s/100${N} — ${B}%s${N}\n\n" "$health_score" "$health_label"
+    }
 
-    if [ "$BHEALTH" != "null" ]; then
-        if [ "$BHEALTH" -lt 50 ] 2>/dev/null; then log_err  "Battery: $BNAME - Health: ${BHEALTH}% CRITICAL"
-        elif [ "$BHEALTH" -lt 75 ] 2>/dev/null; then log_warn "Battery: $BNAME - Health: ${BHEALTH}%"
-        else log_ok "Battery: $BNAME - Health: ${BHEALTH}% - $BSTATUS - ${BCAP}%"; fi
+    if setup_network; then
+        if upload_scan; then
+            local LIVE_URL; LIVE_URL=$(cat "$TMPD/live_url" 2>/dev/null || echo "")
+            show_qr "$LIVE_URL"
+            live_loop
+        else
+            [ "$SILENT" = false ] && \
+                printf "${Y}  Upload failed — JSON saved locally: %s${N}\n" "$OUTPUT_FILE"
+        fi
     else
-        log_ok "Battery: $BNAME - $BSTATUS - ${BCAP}%"
+        [ "$SILENT" = false ] && \
+            printf "${Y}  No internet — JSON saved locally: %s${N}\n" "$OUTPUT_FILE"
     fi
+}
 
-    [ -n "$BAT_JSON" ] && BAT_JSON+=","
-    BAT_JSON+=$(printf '{"name":%s,"status":%s,"charge_remaining":%s,"technology":%s,"manufacturer":%s,"model":%s,"serial":%s,"design_capacity_wh":%s,"full_charge_capacity_wh":%s,"health_pct":%s,"cycle_count":%s,"voltage_v":%s,"power_now_w":%s}' \
-        "$(jstr "$BNAME")" "$(jstr "$BSTATUS")" "$(jnum "$BCAP")" "$(jstr "$BTECH")" \
-        "$(jstr "$BMANUF")" "$(jstr "$BMODEL")" "$(jstr "$BSERIAL")" \
-        "$(jnum "$BDESIGN_WH")" "$(jnum "$BFULL_WH")" "${BHEALTH}" "${BCYCLES}" \
-        "$(jnum "$BVOLT_V")" "$(jnum "$BPOW_W")")
-done
-
-BAT_JSON="[${BAT_JSON}]"
-
-# ============================================================
-# 7. NETWORK
-# ============================================================
-log_section "NETWORK"
-
-NET_JSON=""
-
-for ipath in /sys/class/net/*/; do
-    IFACE=$(basename "$ipath")
-    [ "$IFACE" = "lo" ] && continue
-    ITYPE=$(cat "${ipath}type" 2>/dev/null || echo "0")
-    IS_WLAN="false"
-    IS_BT="false"
-    [ -d "${ipath}wireless" ] || [ -d "${ipath}phy80211" ] && IS_WLAN="true"
-    echo "$IFACE" | grep -qiE "^wl" && IS_WLAN="true"
-    echo "$IFACE" | grep -qiE "^bt|bluetooth" && IS_BT="true"
-    [[ "$ITYPE" =~ ^(1|801|24)$ ]] || [ "$IS_WLAN" = "true" ] || continue
-
-    IMAC=$(cat "${ipath}address" 2>/dev/null || echo "")
-    ISPEED=$(cat "${ipath}speed" 2>/dev/null || echo "")
-    ISTATE=$(cat "${ipath}operstate" 2>/dev/null || echo "unknown")
-    IIP4=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -oP '(?<=inet )[0-9./]+' || echo "")
-    IGW=$(ip route show dev "$IFACE" 2>/dev/null | grep "^default" | awk '{print $3}' | head -1 || echo "")
-    IDRV=$(readlink -f "${ipath}device/driver" 2>/dev/null | xargs basename 2>/dev/null || echo "")
-
-    ISSID=""
-    ISIG=""
-    if [ "$IS_WLAN" = "true" ] && cmd iwconfig; then
-        ISSID=$(iwconfig "$IFACE" 2>/dev/null | grep -oP 'ESSID:"[^"]*"' | cut -d'"' -f2 || echo "")
-        ISIG=$(iwconfig "$IFACE" 2>/dev/null | grep -oP 'Signal level=-?[0-9]+' | grep -oP '-?[0-9]+' || echo "")
-    fi
-
-    TYPE_LBL="LAN"
-    [ "$IS_WLAN" = "true" ] && TYPE_LBL="WiFi"
-    [ "$IS_BT"   = "true" ] && TYPE_LBL="Bluetooth"
-    log_ok "NIC [$TYPE_LBL]: $IFACE - $ISTATE - $IMAC"
-
-    [ -n "$NET_JSON" ] && NET_JSON+=","
-    NET_JSON+=$(printf '{"name":%s,"mac":%s,"speed_mbps":%s,"state":%s,"is_wireless":%s,"is_bluetooth":%s,"driver":%s,"ip4":%s,"gateway":%s,"ssid":%s,"signal_dbm":%s}' \
-        "$(jstr "$IFACE")" "$(jstr "$IMAC")" "$(jnum "${ISPEED:-0}")" "$(jstr "$ISTATE")" \
-        "$IS_WLAN" "$IS_BT" "$(jstr "$IDRV")" "$(jstr "$IIP4")" "$(jstr "$IGW")" \
-        "$(jstr "$ISSID")" "$(jstr "$ISIG")")
-done
-
-NET_JSON="[${NET_JSON}]"
-
-# ============================================================
-# 8. AUDIO
-# ============================================================
-log_section "AUDIO"
-
-AUDIO_JSON=""
-if cmd lspci; then
-    lspci 2>/dev/null | grep -iE "Audio|Sound|Multimedia" > "$TMPD/audio.txt" || true
-    while IFS= read -r line; do
-        ASLOT=$(echo "$line" | cut -d' ' -f1)
-        ANAME=$(echo "$line" | sed 's/^[^ ]* [^:]*: //')
-        ADRV=$(lspci -v -s "$ASLOT" 2>/dev/null | grep "Kernel driver" | sed 's/.*: //' | xargs || echo "")
-        log_ok "Audio: $ANAME"
-        [ -n "$AUDIO_JSON" ] && AUDIO_JSON+=","
-        AUDIO_JSON+=$(printf '{"name":%s,"pci_slot":%s,"driver":%s}' "$(jstr "$ANAME")" "$(jstr "$ASLOT")" "$(jstr "$ADRV")")
-    done < "$TMPD/audio.txt"
-fi
-# ALSA
-ALSA_CARDS=$(cat /proc/asound/cards 2>/dev/null | grep -E "^\s*[0-9]" | head -4 || echo "")
-echo "$ALSA_CARDS" > "$TMPD/alsa.txt"
-while IFS= read -r al; do
-    [ -z "$al" ] && continue
-    ACNAME=$(echo "$al" | sed 's/.*\]: //' | sed 's/ \[.*//')
-    log_info "ALSA: $ACNAME"
-done < "$TMPD/alsa.txt"
-AUDIO_JSON="[${AUDIO_JSON}]"
-
-# ============================================================
-# 9. USB
-# ============================================================
-log_section "USB"
-
-USB_CTRL_JSON=""
-USB_DEV_JSON=""
-USB_COUNT=0
-
-if cmd lspci; then
-    lspci 2>/dev/null | grep -iE "USB|xHCI|eHCI|oHCI|uHCI" > "$TMPD/usb_ctrl.txt" || true
-    while IFS= read -r line; do
-        USLOT=$(echo "$line" | cut -d' ' -f1)
-        UNAME=$(echo "$line" | sed 's/^[^ ]* [^:]*: //')
-        UDRV=$(lspci -v -s "$USLOT" 2>/dev/null | grep "Kernel driver" | sed 's/.*: //' | xargs || echo "")
-        log_ok "USB Controller: $UNAME"
-        [ -n "$USB_CTRL_JSON" ] && USB_CTRL_JSON+=","
-        USB_CTRL_JSON+=$(printf '{"name":%s,"pci_slot":%s,"driver":%s}' "$(jstr "$UNAME")" "$(jstr "$USLOT")" "$(jstr "$UDRV")")
-    done < "$TMPD/usb_ctrl.txt"
-fi
-
-if cmd lsusb; then
-    USB_COUNT=$(lsusb 2>/dev/null | wc -l || echo "0")
-    lsusb 2>/dev/null > "$TMPD/lsusb.txt" || true
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        UBUS=$(echo "$line" | grep -oP 'Bus \K[0-9]+')
-        UDEV=$(echo "$line" | grep -oP 'Device \K[0-9]+')
-        UID2=$(echo "$line" | grep -oP 'ID \K[0-9a-f:]+')
-        UDESC=$(echo "$line" | sed 's/.*ID [^ ]* //')
-        [ -n "$USB_DEV_JSON" ] && USB_DEV_JSON+=","
-        USB_DEV_JSON+=$(printf '{"bus":"%s","device":"%s","id":%s,"name":%s}' "$UBUS" "$UDEV" "$(jstr "$UID2")" "$(jstr "$UDESC")")
-    done < "$TMPD/lsusb.txt"
-    log_ok "USB devices: $USB_COUNT"
-fi
-
-USB_JSON="{\"controllers\":[${USB_CTRL_JSON}],\"connected_count\":${USB_COUNT},\"connected\":[${USB_DEV_JSON}]}"
-
-# ============================================================
-# 10. PCIe DEVICES
-# ============================================================
-log_section "PCIe DEVICES"
-
-PCIE_JSON=""
-if cmd lspci; then
-    lspci 2>/dev/null > "$TMPD/lspci_all.txt" || true
-    while IFS= read -r line; do
-        PSLOT=$(echo "$line" | cut -d' ' -f1)
-        PNAME=$(echo "$line" | sed 's/^[^ ]* [^:]*: //')
-        PPCIID=$(lspci -n -s "$PSLOT" 2>/dev/null | awk '{print $3}' || echo "")
-        PDRV=$(lspci -v -s "$PSLOT" 2>/dev/null | grep "Kernel driver" | sed 's/.*: //' | xargs || echo "")
-        [ -n "$PCIE_JSON" ] && PCIE_JSON+=","
-        PCIE_JSON+=$(printf '{"slot":%s,"name":%s,"pci_id":%s,"driver":%s}' "$(jstr "$PSLOT")" "$(jstr "$PNAME")" "$(jstr "$PPCIID")" "$(jstr "$PDRV")")
-    done < "$TMPD/lspci_all.txt"
-    PCIE_TOTAL=$(wc -l < "$TMPD/lspci_all.txt" || echo "0")
-    log_ok "PCIe devices: $PCIE_TOTAL total"
-fi
-PCIE_JSON="[${PCIE_JSON}]"
-
-# ============================================================
-# 11. THERMALS + FANS + VOLTAGES
-# ============================================================
-log_section "THERMALS & FANS"
-
-THERMAL_ZONES_JSON=""
-FANS_JSON=""
-VOLTAGES_JSON=""
-
-for hwmon in /sys/class/hwmon/hwmon*/; do
-    HNAME=$(cat "${hwmon}name" 2>/dev/null || echo "unknown")
-
-    # Temperatures
-    for tf in "${hwmon}"temp*_input; do
-        [ -f "$tf" ] || continue
-        TLABEL=$(cat "${tf/_input/_label}" 2>/dev/null || basename "$tf" | sed 's/_input//')
-        TRAW=$(cat "$tf" 2>/dev/null || echo "0")
-        TC=$(awk -v r="$TRAW" 'BEGIN{printf "%.1f",r/1000}')
-        TCRIT="null"
-        tcf="${tf/_input/_crit}"
-        if [ -f "$tcf" ]; then
-            tcraw=$(cat "$tcf" 2>/dev/null || echo "0")
-            TCRIT=$(awk -v r="$tcraw" 'BEGIN{printf "%.1f",r/1000}')
-        fi
-
-        is_c=$(awk -v t="$TC" 'BEGIN{print (t>90)?1:0}')
-        is_h=$(awk -v t="$TC" 'BEGIN{print (t>75)?1:0}')
-        if   [ "$is_c" = "1" ]; then log_err  "Thermal: $HNAME/$TLABEL = ${TC}°C CRITICAL"
-        elif [ "$is_h" = "1" ]; then log_warn "Thermal: $HNAME/$TLABEL = ${TC}°C HIGH"
-        else                         log_ok   "Thermal: $HNAME/$TLABEL = ${TC}°C"
-        fi
-
-        [ -n "$THERMAL_ZONES_JSON" ] && THERMAL_ZONES_JSON+=","
-        THERMAL_ZONES_JSON+=$(printf '{"source":%s,"label":%s,"temp_c":%s,"crit_c":%s}' "$(jstr "$HNAME")" "$(jstr "$TLABEL")" "$TC" "$TCRIT")
-    done
-
-    # Fans
-    for ff in "${hwmon}"fan*_input; do
-        [ -f "$ff" ] || continue
-        FRPM=$(cat "$ff" 2>/dev/null || echo "0")
-        FLABEL=$(cat "${ff/_input/_label}" 2>/dev/null || basename "$ff" | sed 's/_input//')
-        log_ok "Fan: $HNAME/$FLABEL = ${FRPM} RPM"
-        [ -n "$FANS_JSON" ] && FANS_JSON+=","
-        FANS_JSON+=$(printf '{"source":%s,"label":%s,"speed_rpm":%s}' "$(jstr "$HNAME")" "$(jstr "$FLABEL")" "$FRPM")
-    done
-
-    # Voltages
-    for vf in "${hwmon}"in*_input; do
-        [ -f "$vf" ] || continue
-        VRAW=$(cat "$vf" 2>/dev/null || echo "0")
-        VV=$(awk -v r="$VRAW" 'BEGIN{printf "%.3f",r/1000}')
-        VLABEL=$(cat "${vf/_input/_label}" 2>/dev/null || basename "$vf" | sed 's/_input//')
-        [ -n "$VOLTAGES_JSON" ] && VOLTAGES_JSON+=","
-        VOLTAGES_JSON+=$(printf '{"source":%s,"label":%s,"value_v":%s}' "$(jstr "$HNAME")" "$(jstr "$VLABEL")" "$VV")
-    done
-done
-
-# ACPI thermal zones
-for tz in /sys/class/thermal/thermal_zone*/; do
-    TZTYPE=$(cat "${tz}type" 2>/dev/null || echo "unknown")
-    TZRAW=$(cat "${tz}temp" 2>/dev/null || echo "0")
-    TZTC=$(awk -v r="$TZRAW" 'BEGIN{printf "%.1f",r/1000}')
-    [ -n "$THERMAL_ZONES_JSON" ] && THERMAL_ZONES_JSON+=","
-    THERMAL_ZONES_JSON+=$(printf '{"source":"acpi","label":%s,"temp_c":%s,"crit_c":null}' "$(jstr "$TZTYPE")" "$TZTC")
-done
-
-THERMAL_JSON="{\"zones\":[${THERMAL_ZONES_JSON}],\"fans\":[${FANS_JSON}],\"voltages\":[${VOLTAGES_JSON}]}"
-
-# ============================================================
-# 12. OPERATING SYSTEM
-# ============================================================
-log_section "OPERATING SYSTEM"
-
-KERNEL=$(uname -r 2>/dev/null || echo "Unknown")
-OS_NAME=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "Linux")
-OS_ID=$(. /etc/os-release 2>/dev/null && echo "$ID" || echo "linux")
-OS_VER=$(. /etc/os-release 2>/dev/null && echo "$VERSION_ID" || echo "")
-ARCH=$(uname -m 2>/dev/null || echo "x86_64")
-HOSTNAME=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown")
-UPTIME_SEC=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo "0")
-UPTIME_H=$(awk -v s="$UPTIME_SEC" 'BEGIN{printf "%.1f",s/3600}')
-LAST_BOOT=$(who -b 2>/dev/null | awk '{print $3,$4}' || date -d "@$(($(date +%s)-UPTIME_SEC))" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "")
-SWAP_TOTAL=$(awk '/SwapTotal/{printf "%.1f",$2/1048576}' /proc/meminfo)
-SWAP_FREE=$(awk '/SwapFree/{printf "%.1f",$2/1048576}' /proc/meminfo)
-INIT_SYS=$(ps -p 1 -o comm= 2>/dev/null || echo "")
-TZ=$(timedatectl show 2>/dev/null | grep "^Timezone=" | cut -d= -f2 || cat /etc/timezone 2>/dev/null || echo "")
-
-log_ok "OS: $OS_NAME - Kernel: $KERNEL ($ARCH)"
-log_ok "Uptime: ${UPTIME_H}h - Boot: $LAST_BOOT"
-
-OS_JSON=$(printf '{"name":%s,"id":%s,"version":%s,"kernel":%s,"architecture":%s,"hostname":%s,"uptime_hours":%s,"last_boot":%s,"total_ram_gb":%s,"free_ram_gb":%s,"swap_total_gb":%s,"swap_free_gb":%s,"timezone":%s,"init_system":%s}' \
-    "$(jstr "$OS_NAME")" "$(jstr "$OS_ID")" "$(jstr "$OS_VER")" "$(jstr "$KERNEL")" \
-    "$(jstr "$ARCH")" "$(jstr "$HOSTNAME")" "$(jnum "$UPTIME_H")" "$(jstr "$LAST_BOOT")" \
-    "$(jnum "$TOTAL_RAM_GB")" "$(jnum "$FREE_RAM_GB")" "$(jnum "$SWAP_TOTAL")" \
-    "$(jnum "$SWAP_FREE")" "$(jstr "$TZ")" "$(jstr "$INIT_SYS")")
-
-# ============================================================
-# 13. SECURITY
-# ============================================================
-log_section "SECURITY"
-
-FW_TYPE="Legacy BIOS"
-SECURE_BOOT="false"
-[ -d /sys/firmware/efi ] && FW_TYPE="UEFI"
-
-if [ "$FW_TYPE" = "UEFI" ] && cmd mokutil; then
-    SBS=$(mokutil --sb-state 2>/dev/null || echo "")
-    echo "$SBS" | grep -qi "enabled" && SECURE_BOOT="true"
-fi
-
-TPM_PRESENT="false"
-TPM_VER=""
-if [ -d /sys/class/tpm ]; then
-    TPM_PRESENT="true"
-    for td in /sys/class/tpm/tpm*/; do
-        TPM_VER=$(cat "${td}tpm_version_major" 2>/dev/null || echo "")
-        break
-    done
-    log_ok "TPM v${TPM_VER} detected"
-fi
-
-ASLR=$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo "0")
-PTRACE=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo "")
-UFW_ST=$(ufw status 2>/dev/null | head -1 | sed 's/Status: //' || echo "")
-
-log_ok "Firmware: $FW_TYPE - Secure Boot: $SECURE_BOOT"
-
-SECURITY_JSON=$(printf '{"firmware_type":%s,"secure_boot":%s,"tpm_present":%s,"tpm_version":%s,"kernel_aslr":%s,"ptrace_scope":%s,"firewall_ufw":%s}' \
-    "$(jstr "$FW_TYPE")" "$(jstr "$SECURE_BOOT")" "$TPM_PRESENT" "$(jstr "$TPM_VER")" \
-    "$(jnum "$ASLR")" "$(jstr "$PTRACE")" "$(jstr "$UFW_ST")")
-
-# ============================================================
-# 14. PERFORMANCE
-# ============================================================
-log_section "PERFORMANCE"
-
-read -r LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
-log_ok "Load: $LOAD1 / $LOAD5 / $LOAD15"
-
-RAM_TOTAL_P=$(awk '/MemTotal/{printf "%.1f",$2/1048576}' /proc/meminfo)
-RAM_FREE_P=$(awk '/MemAvailable/{printf "%.1f",$2/1048576}' /proc/meminfo)
-RAM_USED_P=$(awk "BEGIN{printf \"%.1f\",$RAM_TOTAL_P - $RAM_FREE_P}")
-RAM_PCT_P=$(awk "BEGIN{printf \"%.0f\",($RAM_USED_P/$RAM_TOTAL_P)*100}" 2>/dev/null || echo "0")
-
-VOLS_JSON=""
-df -h --output=source,size,used,avail,pcent,target 2>/dev/null | tail -n+2 | grep -vE "^(tmpfs|udev|devtmpfs|none)" > "$TMPD/df.txt" || true
-while IFS= read -r vl; do
-    [ -z "$vl" ] && continue
-    VFS=$(echo "$vl" | awk '{print $1}')
-    VSZ=$(echo "$vl" | awk '{print $2}')
-    VUS=$(echo "$vl" | awk '{print $3}')
-    VAV=$(echo "$vl" | awk '{print $4}')
-    VPC=$(echo "$vl" | awk '{print $5}' | tr -d '%')
-    VMT=$(echo "$vl" | awk '{print $6}')
-    VPC_INT="${VPC%.*}"
-    [ "${VPC_INT:-0}" -gt 90 ] 2>/dev/null && log_err  "Disk $VMT: ${VPC}% full - CRITICALLY LOW"
-    [ "${VPC_INT:-0}" -gt 80 ] 2>/dev/null && log_warn "Disk $VMT: ${VPC}% full"
-    [ -n "$VOLS_JSON" ] && VOLS_JSON+=","
-    VOLS_JSON+=$(printf '{"mount":%s,"filesystem":%s,"size":%s,"used":%s,"available":%s,"used_pct":%s}' \
-        "$(jstr "$VMT")" "$(jstr "$VFS")" "$(jstr "$VSZ")" "$(jstr "$VUS")" "$(jstr "$VAV")" "$(jnum "$VPC")")
-done < "$TMPD/df.txt"
-
-PROC_COUNT=$(ps aux --no-header 2>/dev/null | wc -l || echo "0")
-
-TOP_PROCS_JSON=""
-ps aux --no-header 2>/dev/null | sort -rn -k3 | head -10 > "$TMPD/procs.txt" || true
-while IFS= read -r pl; do
-    [ -z "$pl" ] && continue
-    P_PID=$(echo "$pl" | awk '{print $2}')
-    PCPU=$(echo "$pl" | awk '{print $3}')
-    PMEM=$(echo "$pl" | awk '{print $4}')
-    PCMD=$(echo "$pl" | awk '{print $11}')
-    [ -n "$TOP_PROCS_JSON" ] && TOP_PROCS_JSON+=","
-    TOP_PROCS_JSON+=$(printf '{"pid":%s,"cpu_pct":%s,"mem_pct":%s,"name":%s}' "$(jnum "$P_PID")" "$(jnum "$PCPU")" "$(jnum "$PMEM")" "$(jstr "$PCMD")")
-done < "$TMPD/procs.txt"
-
-PERF_JSON=$(printf '{"load_1m":%s,"load_5m":%s,"load_15m":%s,"ram_total_gb":%s,"ram_used_gb":%s,"ram_free_gb":%s,"ram_used_pct":%s,"process_count":%s,"top_processes":[%s],"volumes":[%s]}' \
-    "$(jnum "$LOAD1")" "$(jnum "$LOAD5")" "$(jnum "$LOAD15")" \
-    "$(jnum "$RAM_TOTAL_P")" "$(jnum "$RAM_USED_P")" "$(jnum "$RAM_FREE_P")" "$(jnum "$RAM_PCT_P")" \
-    "$(jnum "$PROC_COUNT")" "$TOP_PROCS_JSON" "$VOLS_JSON")
-
-# ============================================================
-# 15. BIOS DEEP
-# ============================================================
-log_section "BIOS / UEFI"
-
-BIOS_SERIAL=$(dmi "bios-serial" || echo "")
-EC_VER=$(dmidecode -t 0 2>/dev/null | grep "EC Firmware" | sed 's/.*Revision: //' | xargs || echo "")
-
-BIOS_DEEP_JSON=$(printf '{"firmware_type":%s,"vendor":%s,"version":%s,"release_date":%s,"board_product":%s,"board_vendor":%s,"board_version":%s,"ec_version":%s}' \
-    "$(jstr "$FW_TYPE")" "$(jstr "$BIOS_VENDOR")" "$(jstr "$BIOS_VERSION")" "$(jstr "$BIOS_DATE")" \
-    "$(jstr "$BOARD_PRODUCT")" "$(jstr "$BOARD_VENDOR")" "$(jstr "$BOARD_VERSION")" "$(jstr "$EC_VER")")
-
-# ============================================================
-# 16. PROBLEM DEVICES (dmesg errors)
-# ============================================================
-log_section "PROBLEM DEVICES"
-
-PROB_JSON=""
-dmesg 2>/dev/null | grep -iE "error|fail|firmware: failed|ACPI Error" | grep -viE "firmware loaded|Calibrat|module" | tail -15 > "$TMPD/dmesg_errs.txt" || true
-while IFS= read -r pl; do
-    [ -z "$pl" ] && continue
-    PMSG=$(echo "$pl" | sed 's/\[.*\] //')
-    log_warn "Device issue: $PMSG"
-    [ -n "$PROB_JSON" ] && PROB_JSON+=","
-    PROB_JSON+=$(printf '{"message":%s,"source":"dmesg"}' "$(jstr "$PMSG")")
-done < "$TMPD/dmesg_errs.txt"
-[ -z "$PROB_JSON" ] && log_ok "No obvious device errors in dmesg"
-PROB_JSON="[${PROB_JSON}]"
-
-# ============================================================
-# 17. CHANGE DETECTION (non-stock components)
-# ============================================================
-log_section "COMPONENT CHANGE DETECTION"
-
-CHANGES_JSON=""
-
-# Mixed RAM vendors
-if [ "$USED_SLOTS" -ge 2 ]; then
-    RAM_VENDORS=$(echo "$RAM_MODS_JSON" | grep -oP '"manufacturer":"[^"]+"' | sort -u | wc -l)
-    if [ "${RAM_VENDORS:-1}" -gt 1 ] 2>/dev/null; then
-        log_warn "RAM: Mixed manufacturers detected - possible upgrade"
-        CHANGES_JSON+="{\"component\":\"RAM\",\"type\":\"MIXED_VENDOR\",\"severity\":\"info\",\"detail\":\"Multiple RAM manufacturers detected - possible upgrade\"}"
-    fi
-fi
-
-# Multiple GPUs
-GPU_COUNT=$(echo "$GPU_JSON" | grep -o '"name"' | wc -l)
-if [ "${GPU_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-    [ -n "$CHANGES_JSON" ] && CHANGES_JSON+=","
-    log_info "GPU: Multiple adapters - dGPU alongside iGPU"
-    CHANGES_JSON+="{\"component\":\"GPU\",\"type\":\"DISCRETE_GPU_PRESENT\",\"severity\":\"info\",\"detail\":\"Multiple GPUs detected\"}"
-fi
-
-# NVMe + SATA mix
-if echo "$STORAGE_JSON" | grep -q '"transport":"sata"' && echo "$STORAGE_JSON" | grep -q '"transport":"nvme"'; then
-    [ -n "$CHANGES_JSON" ] && CHANGES_JSON+=","
-    CHANGES_JSON+="{\"component\":\"Storage\",\"type\":\"MIXED_TRANSPORT\",\"severity\":\"info\",\"detail\":\"Both NVMe and SATA storage present\"}"
-fi
-
-CHANGE_SUMMARY="No obvious component changes detected"
-CHANGES_COUNT=$(echo "$CHANGES_JSON" | grep -o '"component"' | wc -l)
-[ "${CHANGES_COUNT:-0}" -gt 0 ] 2>/dev/null && CHANGE_SUMMARY="${CHANGES_COUNT} potential change(s) flagged"
-[ "${CHANGES_COUNT:-0}" -gt 0 ] 2>/dev/null && log_warn "$CHANGE_SUMMARY" || log_ok "$CHANGE_SUMMARY"
-
-CHANGE_JSON=$(printf '{"model_id":%s,"changes":[%s],"summary":%s}' "$(jstr "$MODEL_ID")" "$CHANGES_JSON" "$(jstr "$CHANGE_SUMMARY")")
-
-# ============================================================
-# 18. SYMPTOM -> HARDWARE DIAGNOSIS
-# ============================================================
-log_section "SYMPTOM ANALYSIS"
-
-SYMPTOM_DETECTED=""
-SYMPTOMS_JSON=""
-
-# Symptom: SMART failure
-if echo "$STORAGE_JSON" | grep -q '"smart_failing":true'; then
-    log_err "SYMPTOM: Storage failure detected"
-    [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-    SYMPTOMS_JSON+='{"symptom":"Storage device failing","severity":"critical","detected_by":"SMART","hardware_component":"Storage","likely_causes":["Failing HDD/SSD - imminent data loss","Bad sectors accumulating","NVMe wear-out"],"immediate_actions":["BACK UP ALL DATA IMMEDIATELY","Replace drive before next boot if possible"],"diagnostic_steps":["Run extended SMART test: smartctl -t long /dev/sdX","Check reallocated sectors count","Clone drive with ddrescue before it dies"]}'
-fi
-
-# Symptom: Critical CPU temp
-if [ "$CPU_TEMP" != "null" ]; then
-    is_crit=$(awk -v t="$CPU_TEMP" 'BEGIN{print (t>90)?1:0}' 2>/dev/null || echo "0")
-    is_high=$(awk -v t="$CPU_TEMP" 'BEGIN{print (t>75)?1:0}' 2>/dev/null || echo "0")
-    if [ "$is_crit" = "1" ]; then
-        log_err "SYMPTOM: CPU temperature critical (${CPU_TEMP}°C)"
-        [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-        SYMPTOMS_JSON+=$(printf '{"symptom":"CPU temperature critical (%sC)","severity":"critical","detected_by":"sensors","hardware_component":"CPU / Cooling","likely_causes":["Heatsink clogged with dust","Thermal paste dried out","Heatsink not seated properly","Fan not spinning"],"immediate_actions":["Shut down to prevent permanent damage","Do not run under load"],"diagnostic_steps":["Open laptop and check fan rotation","Clean heatsink fins with compressed air","Replace thermal paste (every 2-3 years)","Reseat heatsink and check screws are tight"]}' "$CPU_TEMP")
-    elif [ "$is_high" = "1" ]; then
-        log_warn "SYMPTOM: CPU temperature high (${CPU_TEMP}°C)"
-        [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-        SYMPTOMS_JSON+=$(printf '{"symptom":"CPU temperature high (%sC)","severity":"warning","detected_by":"sensors","hardware_component":"CPU / Cooling","likely_causes":["Dust buildup in heatsink","Thermal paste degraded","Fan running slowly"],"immediate_actions":["Avoid heavy workloads","Ensure ventilation is not blocked"],"diagnostic_steps":["Clean heatsink with compressed air","Check fan RPM","Consider replacing thermal paste"]}' "$CPU_TEMP")
-    fi
-fi
-
-# Symptom: Battery critical health
-if [ "$IS_LAPTOP" = "true" ]; then
-    BHEALTH_CHECK=$(echo "$BAT_JSON" | grep -oP '"health_pct":\K[0-9]+' | head -1 || echo "100")
-    if [ "${BHEALTH_CHECK:-100}" -lt 50 ] 2>/dev/null; then
-        log_err "SYMPTOM: Battery critically degraded (${BHEALTH_CHECK}%)"
-        [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-        SYMPTOMS_JSON+=$(printf '{"symptom":"Battery critically degraded (%s%% health)","severity":"critical","detected_by":"upower","hardware_component":"Battery","likely_causes":["Battery cell degradation - normal after 2-3 years","Battery has been deep-discharged repeatedly","Battery age > 500 charge cycles"],"immediate_actions":["Always use with AC adapter connected","Replace battery as soon as possible"],"diagnostic_steps":["Check cycle count","Order replacement battery by part number","Avoid full discharge/charge cycles until replaced"]}' "$BHEALTH_CHECK")
-    elif [ "${BHEALTH_CHECK:-100}" -lt 75 ] 2>/dev/null; then
-        log_warn "SYMPTOM: Battery health low (${BHEALTH_CHECK}%)"
-        [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-        SYMPTOMS_JSON+=$(printf '{"symptom":"Battery health low (%s%%)","severity":"warning","detected_by":"upower","hardware_component":"Battery","likely_causes":["Normal degradation","High cycle count"],"immediate_actions":["Plan battery replacement"],"diagnostic_steps":["Check cycle count vs manufacturer max","Calibrate battery (full discharge then full charge)"]}' "$BHEALTH_CHECK")
-    fi
-fi
-
-# Symptom: No RAM in slot (single channel when dual expected)
-if [ "$USED_SLOTS" -eq 1 ] && [ "$TOTAL_SLOTS" -ge 2 ]; then
-    log_warn "SYMPTOM: Single RAM module in dual-slot system"
-    [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-    SYMPTOMS_JSON+='{"symptom":"Single RAM module - dual-channel slot empty","severity":"warning","detected_by":"dmidecode","hardware_component":"RAM","likely_causes":["Second slot always empty (stock config)","RAM module removed/failed","Slot damaged"],"immediate_actions":["Reseat RAM in slot A","Test with RAM in slot B instead"],"diagnostic_steps":["Check if slot B is physically damaged","Try RAM in each slot individually","Add matching RAM for dual-channel (+35% memory bandwidth)"]}'
-fi
-
-# Symptom: CPU throttling
-if [ "$CPU_FREQ_RATIO" != "null" ] && [ "${CPU_FREQ_RATIO:-100}" -lt 50 ] 2>/dev/null; then
-    log_warn "SYMPTOM: CPU running at ${CPU_FREQ_RATIO}% of max frequency - throttling"
-    [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-    SYMPTOMS_JSON+=$(printf '{"symptom":"CPU throttling - running at %s%% of max speed","severity":"warning","detected_by":"cpufreq","hardware_component":"CPU / Power","likely_causes":["Thermal throttling due to overheating","Power limit throttling (underpowered adapter)","BIOS power limit settings"],"immediate_actions":["Check CPU temperature","Check AC adapter wattage"],"diagnostic_steps":["Clean cooling system","Check BIOS power settings","Verify correct AC adapter wattage for this model"]}' "$CPU_FREQ_RATIO")
-fi
-
-# Symptom: High RAM usage
-if [ "${RAM_PCT:-0}" -gt 90 ] 2>/dev/null; then
-    log_err "SYMPTOM: RAM usage critical (${RAM_PCT}%)"
-    [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-    SYMPTOMS_JSON+=$(printf '{"symptom":"RAM usage critical (%s%%)","severity":"critical","detected_by":"meminfo","hardware_component":"RAM","likely_causes":["Insufficient RAM for workload","Memory leak in running process","RAM module not detected"],"immediate_actions":["Close unnecessary applications","Check if expected RAM total matches installed"],"diagnostic_steps":["Compare detected RAM vs expected","Run memtest86 for hardware faults","Check dmesg for memory errors"]}' "$RAM_PCT")
-fi
-
-# Symptom: dmesg errors
-DMESG_ERR_COUNT=$(echo "$PROB_JSON" | grep -o '"message"' | wc -l)
-if [ "${DMESG_ERR_COUNT:-0}" -gt 3 ] 2>/dev/null; then
-    log_warn "SYMPTOM: Multiple device errors in kernel log ($DMESG_ERR_COUNT errors)"
-    [ -n "$SYMPTOMS_JSON" ] && SYMPTOMS_JSON+=","
-    SYMPTOMS_JSON+=$(printf '{"symptom":"Multiple kernel device errors (%s)","severity":"warning","detected_by":"dmesg","hardware_component":"Various","likely_causes":["Driver issues","Failing hardware","Firmware incompatibility"],"immediate_actions":["Review error messages in Problem Devices section"],"diagnostic_steps":["Run: dmesg | grep -iE error","Update drivers/firmware","Test hardware individually"]}' "$DMESG_ERR_COUNT")
-fi
-
-SYMPTOMS_JSON="[${SYMPTOMS_JSON}]"
-SYMPTOM_COUNT=$(echo "$SYMPTOMS_JSON" | grep -o '"symptom"' | wc -l)
-log_info "Symptoms detected: $SYMPTOM_COUNT"
-
-# ============================================================
-# 19. DIAGNOSTIC SUMMARY + HEALTH SCORE
-# ============================================================
-log_section "DIAGNOSTIC SUMMARY"
-
-HEALTH=100
-ISSUES_JSON=""
-WARNS_JSON=""
-
-# Deduct points
-echo "$STORAGE_JSON" | grep -q '"smart_failing":true' && \
-    { HEALTH=$((HEALTH-30)); [ -n "$ISSUES_JSON" ] && ISSUES_JSON+=","; ISSUES_JSON+='"STORAGE FAILING - BACK UP IMMEDIATELY"'; }
-
-if [ "$CPU_TEMP" != "null" ]; then
-    awk -v t="$CPU_TEMP" 'BEGIN{exit !(t>90)}' && \
-        { HEALTH=$((HEALTH-20)); [ -n "$ISSUES_JSON" ] && ISSUES_JSON+=","; ISSUES_JSON+="\"CPU CRITICAL: ${CPU_TEMP}°C\""; }
-    awk -v t="$CPU_TEMP" 'BEGIN{exit !(t>75 && t<=90)}' && \
-        { HEALTH=$((HEALTH-10)); [ -n "$WARNS_JSON" ] && WARNS_JSON+=","; WARNS_JSON+="\"CPU temperature high: ${CPU_TEMP}°C\""; }
-fi
-
-BHEALTH_F=$(echo "$BAT_JSON" | grep -oP '"health_pct":\K[0-9]+' | head -1 || echo "100")
-[ "${BHEALTH_F:-100}" -lt 50 ] 2>/dev/null && \
-    { HEALTH=$((HEALTH-20)); [ -n "$ISSUES_JSON" ] && ISSUES_JSON+=","; ISSUES_JSON+="\"Battery critically degraded: ${BHEALTH_F}%\""; }
-[ "${BHEALTH_F:-100}" -ge 50 ] 2>/dev/null && [ "${BHEALTH_F:-100}" -lt 75 ] 2>/dev/null && \
-    { HEALTH=$((HEALTH-10)); [ -n "$WARNS_JSON" ] && WARNS_JSON+=","; WARNS_JSON+="\"Battery health low: ${BHEALTH_F}%\""; }
-
-[ "${RAM_PCT:-0}" -gt 90 ] 2>/dev/null && \
-    { HEALTH=$((HEALTH-10)); [ -n "$WARNS_JSON" ] && WARNS_JSON+=","; WARNS_JSON+="\"RAM usage critical: ${RAM_PCT}%\""; }
-
-DMESG_EC=$(echo "$PROB_JSON" | grep -o '"message"' | wc -l)
-[ "${DMESG_EC:-0}" -gt 5 ] 2>/dev/null && HEALTH=$((HEALTH-10))
-
-[ "$HEALTH" -lt 0 ]   && HEALTH=0
-[ "$HEALTH" -gt 100 ] && HEALTH=100
-
-if   [ "$HEALTH" -ge 80 ]; then HEALTH_LABEL="GOOD"
-elif [ "$HEALTH" -ge 60 ]; then HEALTH_LABEL="FAIR"
-elif [ "$HEALTH" -ge 40 ]; then HEALTH_LABEL="POOR"
-else                             HEALTH_LABEL="CRITICAL"; fi
-
-ISSUES_COUNT=$(echo "[$ISSUES_JSON]" | grep -o '"' | wc -l | awk '{print int($1/2)}')
-WARNS_COUNT=$(echo "[$WARNS_JSON]" | grep -o '"' | wc -l | awk '{print int($1/2)}')
-
-RECOMMENDATION="System appears healthy. Continue routine monitoring."
-[ "${ISSUES_COUNT:-0}" -gt 0 ] 2>/dev/null && \
-    RECOMMENDATION=$(echo "[$ISSUES_JSON]" | grep -oP '"[^"]+"' | head -1 | tr -d '"' | sed 's/^/Immediate attention: /')
-[ "${WARNS_COUNT:-0}" -gt 0 ] 2>/dev/null && [ "${ISSUES_COUNT:-0}" -eq 0 ] && \
-    RECOMMENDATION=$(echo "[$WARNS_JSON]" | grep -oP '"[^"]+"' | head -1 | tr -d '"' | sed 's/^/Monitor: /')
-
-SCORE_C="$G"; [ "$HEALTH" -lt 80 ] && SCORE_C="$Y"; [ "$HEALTH" -lt 60 ] && SCORE_C="$R"
-printf "\n  ${D}─────────────────────────────────────────────────────${N}\n"
-printf   "  ${W}HEALTH SCORE: ${SCORE_C}%d/100 [%s]${N}\n\n" "$HEALTH" "$HEALTH_LABEL"
-
-DIAG_JSON=$(printf '{"health_score":%s,"health_label":%s,"issues_count":%s,"warnings_count":%s,"issues":[%s],"warnings":[%s],"platine_recommendation":%s}' \
-    "$HEALTH" "$(jstr "$HEALTH_LABEL")" "${ISSUES_COUNT:-0}" "${WARNS_COUNT:-0}" \
-    "$ISSUES_JSON" "$WARNS_JSON" "$(jstr "$RECOMMENDATION")")
-
-# ============================================================
-# 20. PLATINE MAP COMPONENTS (for platine-v5.html)
-# ============================================================
-log_section "GENERATING PLATINE MAP"
-
-MAP_COMPONENTS=""
-
-# CPU
-CPU_STATUS="ok"
-[ "$CPU_TEMP" != "null" ] && awk -v t="$CPU_TEMP" 'BEGIN{exit !(t>90)}' && CPU_STATUS="err"
-[ "$CPU_TEMP" != "null" ] && awk -v t="$CPU_TEMP" 'BEGIN{exit !(t>75 && t<=90)}' && CPU_STATUS="warn"
-MAP_COMPONENTS+=$(printf '{"id":"cpu_0","type":"cpu","name":%s,"ref":%s,"zone":"cpu_soc","status":%s,"live_temp_c":%s,"live_load_pct":%s,"specs":{"cores":%s,"threads":%s,"base_mhz":%s,"arch":%s,"stepping":%s}}' \
-    "$(jstr "$CPU_MODEL")" "$(jstr "${CPU_CORES}C/${CPU_LOGICAL}T @ ${CPU_MAX_MHZ}MHz")" "$(jstr "$CPU_STATUS")" \
-    "$CPU_TEMP" "$(jnum "$CPU_LOAD")" "$(jnum "$CPU_CORES")" "$(jnum "$CPU_LOGICAL")" \
-    "$(jnum "$CPU_MAX_MHZ")" "$(jstr "$CPU_ARCH")" "$(jstr "$CPU_STEPPING")")
-
-# RAM modules
-SLOT_IDX=0
-if [ -n "$RAM_MODS_JSON" ]; then
-    echo "[${RAM_MODS_JSON}]" | grep -oP '\{[^}]+\}' > "$TMPD/ram_mods.txt" || true
-    while IFS= read -r rm; do
-        [ -z "$rm" ] && continue
-        RM_SLOT=$(echo "$rm" | grep -oP '"slot":"[^"]+"' | cut -d'"' -f4)
-        RM_SIZE=$(echo "$rm" | grep -oP '"size_gb":[0-9.]+' | cut -d: -f2)
-        RM_TYPE=$(echo "$rm" | grep -oP '"type":"[^"]+"' | cut -d'"' -f4)
-        RM_SPD=$(echo "$rm"  | grep -oP '"speed_mhz":[0-9]+' | cut -d: -f2)
-        [ -n "$MAP_COMPONENTS" ] && MAP_COMPONENTS+=","
-        MAP_COMPONENTS+=$(printf '{"id":"ram_%s","type":"ram","name":%s,"ref":%s,"zone":"memory_storage","status":"ok","specs":{"size_gb":%s,"type":%s,"speed_mhz":%s,"slot":%s}}' \
-            "$SLOT_IDX" "$(jstr "RAM $RM_SLOT")" "$(jstr "${RM_SIZE}GB $RM_TYPE ${RM_SPD}MHz")" \
-            "$(jnum "$RM_SIZE")" "$(jstr "$RM_TYPE")" "$(jnum "$RM_SPD")" "$(jstr "$RM_SLOT")")
-        SLOT_IDX=$((SLOT_IDX+1))
-    done < "$TMPD/ram_mods.txt"
-fi
-
-# Storage
-DISK_IDX=0
-echo "$STORAGE_JSON" | grep -oP '\{[^{}]*"device"[^{}]*\}' > "$TMPD/map_disks.txt" || true
-while IFS= read -r disk; do
-    [ -z "$disk" ] && continue
-    DMODEL=$(echo "$disk" | grep -oP '"model":"[^"]+"' | cut -d'"' -f4)
-    DSZ=$(echo "$disk" | grep -oP '"size_gb":[0-9.]+' | cut -d: -f2)
-    DTRANS=$(echo "$disk" | grep -oP '"transport":"[^"]+"' | cut -d'"' -f4)
-    DFAIL=$(echo "$disk" | grep -oP '"smart_failing":(true|false)' | cut -d: -f2)
-    DST="ok"; [ "$DFAIL" = "true" ] && DST="err"
-    [ -n "$MAP_COMPONENTS" ] && MAP_COMPONENTS+=","
-    MAP_COMPONENTS+=$(printf '{"id":"storage_%s","type":"storage","name":%s,"ref":%s,"zone":"memory_storage","status":%s,"smart_failing":%s}' \
-        "$DISK_IDX" "$(jstr "$DMODEL")" "$(jstr "${DSZ}GB $DTRANS")" "$(jstr "$DST")" "${DFAIL:-false}")
-    DISK_IDX=$((DISK_IDX+1))
-done < "$TMPD/map_disks.txt"
-
-# GPUs
-GPU_IDX=0
-echo "$GPU_JSON" | grep -oP '\{[^{}]*"name"[^{}]*\}' > "$TMPD/map_gpus.txt" || true
-while IFS= read -r gpu; do
-    [ -z "$gpu" ] && continue
-    GNAME2=$(echo "$gpu" | grep -oP '"name":"[^"]+"' | head -1 | cut -d'"' -f4)
-    GVRAM2=$(echo "$gpu" | grep -oP '"vram_mb":[0-9]+' | cut -d: -f2 || echo "null")
-    GIGPU=$(echo "$gpu" | grep -oP '"is_integrated":(true|false)' | cut -d: -f2)
-    [ -n "$MAP_COMPONENTS" ] && MAP_COMPONENTS+=","
-    MAP_COMPONENTS+=$(printf '{"id":"gpu_%s","type":"gpu","name":%s,"ref":%s,"zone":"cpu_soc","status":"ok","is_integrated":%s}' \
-        "$GPU_IDX" "$(jstr "$GNAME2")" "$(jstr "VRAM: ${GVRAM2}MB")" "${GIGPU:-false}")
-    GPU_IDX=$((GPU_IDX+1))
-done < "$TMPD/map_gpus.txt"
-
-# Battery
-if [ "$IS_LAPTOP" = "true" ] && [ -n "$BAT_JSON" ]; then
-    BH2=$(echo "$BAT_JSON" | grep -oP '"health_pct":\K[0-9]+' | head -1 || echo "100")
-    BST="ok"; [ "${BH2:-100}" -lt 50 ] 2>/dev/null && BST="err"; [ "${BH2:-100}" -lt 75 ] 2>/dev/null && [ "${BH2:-100}" -ge 50 ] 2>/dev/null && BST="warn"
-    BCAP2=$(echo "$BAT_JSON" | grep -oP '"charge_remaining":\K[0-9]+' | head -1 || echo "0")
-    [ -n "$MAP_COMPONENTS" ] && MAP_COMPONENTS+=","
-    MAP_COMPONENTS+=$(printf '{"id":"battery_0","type":"battery","name":"Battery","ref":%s,"zone":"power","status":%s,"specs":{"health_pct":%s,"charge_pct":%s}}' \
-        "$(jstr "Health: ${BH2}% - Charge: ${BCAP2}%")" "$(jstr "$BST")" "${BH2}" "${BCAP2}")
-fi
-
-# Network adapters
-NET_IDX=0
-echo "$NET_JSON" | grep -oP '\{[^{}]*"name"[^{}]*\}' > "$TMPD/map_nets.txt" || true
-while IFS= read -r nic; do
-    [ -z "$nic" ] && continue
-    NNAME2=$(echo "$nic" | grep -oP '"name":"[^"]+"' | head -1 | cut -d'"' -f4)
-    NWLAN=$(echo "$nic" | grep -oP '"is_wireless":(true|false)' | cut -d: -f2)
-    NBT=$(echo "$nic" | grep -oP '"is_bluetooth":(true|false)' | cut -d: -f2)
-    NTYPE="ethernet"; [ "$NWLAN" = "true" ] && NTYPE="wifi"; [ "$NBT" = "true" ] && NTYPE="bluetooth"
-    NSTATE=$(echo "$nic" | grep -oP '"state":"[^"]+"' | cut -d'"' -f4)
-    NST="ok"; [ "$NSTATE" = "down" ] && NST="warn"
-    [ -n "$MAP_COMPONENTS" ] && MAP_COMPONENTS+=","
-    MAP_COMPONENTS+=$(printf '{"id":"net_%s","type":%s,"name":%s,"ref":%s,"zone":"io","status":%s}' \
-        "$NET_IDX" "$(jstr "$NTYPE")" "$(jstr "$NNAME2")" "$(jstr "$NSTATE")" "$(jstr "$NST")")
-    NET_IDX=$((NET_IDX+1))
-done < "$TMPD/map_nets.txt"
-
-# Audio
-if [ -n "$AUDIO_JSON" ] && [ "$AUDIO_JSON" != "[]" ]; then
-    ANAME2=$(echo "$AUDIO_JSON" | grep -oP '"name":"[^"]+"' | head -1 | cut -d'"' -f4)
-    [ -n "$MAP_COMPONENTS" ] && MAP_COMPONENTS+=","
-    MAP_COMPONENTS+=$(printf '{"id":"audio_0","type":"audio","name":%s,"ref":"Audio Codec","zone":"display_audio","status":"ok"}' "$(jstr "$ANAME2")")
-fi
-
-COMPONENT_COUNT=$(echo "[$MAP_COMPONENTS]" | grep -o '"id"' | wc -l)
-log_ok "Platine map generated: $COMPONENT_COUNT components"
-
-# ============================================================
-# 21. ASSEMBLE FINAL JSON
-# ============================================================
-log_section "EXPORTING"
-
-SAFE_MODEL=$(printf '%s_%s' "$MANUFACTURER" "$MODEL" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/_/g' | cut -c1-40)
-DATESTAMP=$(date '+%Y%m%d_%H%M%S')
-OUTFILE="${OUTPUT_DIR}/platine-scan_${SAFE_MODEL}_${DATESTAMP}.json"
-
-{
-printf '{\n'
-printf '  "platine_version": %s,\n'   "$(jstr "$PLATINE_VERSION")"
-printf '  "scan_id": %s,\n'           "$(jstr "$SCAN_ID")"
-printf '  "scan_date": %s,\n'         "$(jstr "$SCAN_DATE")"
-printf '  "scan_type": "full_discovery",\n'
-printf '  "scanner": "Platine Live USB (Linux)",\n'
-printf '  "machine": {\n'
-printf '    "manufacturer": %s,\n'    "$(jstr "$MANUFACTURER")"
-printf '    "model": %s,\n'           "$(jstr "$MODEL")"
-printf '    "model_version": %s,\n'   "$(jstr "$MODEL_VERSION")"
-printf '    "model_id": %s,\n'        "$(jstr "$MODEL_ID")"
-printf '    "board_product": %s,\n'   "$(jstr "$BOARD_PRODUCT")"
-printf '    "board_vendor": %s,\n'    "$(jstr "$BOARD_VENDOR")"
-printf '    "board_version": %s,\n'   "$(jstr "$BOARD_VERSION")"
-printf '    "board_serial": %s,\n'    "$(jstr "$BOARD_SERIAL")"
-printf '    "system_serial": %s,\n'   "$(jstr "$SYSTEM_SERIAL")"
-printf '    "chassis_type": %s,\n'    "$(jstr "$CHASSIS_TYPE")"
-printf '    "bios_vendor": %s,\n'     "$(jstr "$BIOS_VENDOR")"
-printf '    "bios_version": %s,\n'    "$(jstr "$BIOS_VERSION")"
-printf '    "bios_date": %s\n'        "$(jstr "$BIOS_DATE")"
-printf '  },\n'
-printf '  "cpu": %s,\n'               "$CPU_JSON"
-printf '  "memory": %s,\n'            "$MEMORY_JSON"
-printf '  "storage": %s,\n'           "$STORAGE_JSON"
-printf '  "gpu": %s,\n'               "$GPU_JSON"
-printf '  "battery": %s,\n'           "$BAT_JSON"
-printf '  "power_source": %s,\n'      "$(jstr "$POWER_SOURCE")"
-printf '  "network": %s,\n'           "$NET_JSON"
-printf '  "audio": %s,\n'             "$AUDIO_JSON"
-printf '  "usb": %s,\n'               "$USB_JSON"
-printf '  "pci_devices": %s,\n'       "$PCIE_JSON"
-printf '  "thermals": %s,\n'          "$THERMAL_JSON"
-printf '  "os": %s,\n'                "$OS_JSON"
-printf '  "security": %s,\n'          "$SECURITY_JSON"
-printf '  "performance": %s,\n'       "$PERF_JSON"
-printf '  "bios_deep": %s,\n'         "$BIOS_DEEP_JSON"
-printf '  "problem_devices": %s,\n'   "$PROB_JSON"
-printf '  "change_detection": %s,\n'  "$CHANGE_JSON"
-printf '  "symptom_analysis": %s,\n'  "$SYMPTOMS_JSON"
-printf '  "diagnostic_summary": %s,\n' "$DIAG_JSON"
-printf '  "platine_map": {\n'
-printf '    "schema_version": "1.0",\n'
-printf '    "model_id": %s,\n'        "$(jstr "$MODEL_ID")"
-printf '    "manufacturer": %s,\n'    "$(jstr "$MANUFACTURER")"
-printf '    "model": %s,\n'           "$(jstr "$MODEL")"
-printf '    "scan_id": %s,\n'         "$(jstr "$SCAN_ID")"
-printf '    "scan_date": %s,\n'       "$(jstr "$SCAN_DATE")"
-printf '    "health_score": %d,\n'    "$HEALTH"
-printf '    "health_label": %s,\n'    "$(jstr "$HEALTH_LABEL")"
-printf '    "dual_channel": %s,\n'    "$DUAL_CHANNEL"
-printf '    "bios_version": %s,\n'    "$(jstr "$BIOS_VERSION")"
-printf '    "is_laptop": %s,\n'       "$IS_LAPTOP"
-printf '    "components": [%s],\n'    "$MAP_COMPONENTS"
-printf '    "issues": [%s],\n'        "$ISSUES_JSON"
-printf '    "warnings": [%s],\n'      "$WARNS_JSON"
-printf '    "symptoms": %s,\n'        "$SYMPTOMS_JSON"
-printf '    "change_detection": %s\n' "$CHANGE_JSON"
-printf '  }\n'
-printf '}\n'
-} > "$OUTFILE"
-
-# ── Clean JSON with Python (fixes bash generation bugs) ───────
-if cmd python3; then
-    python3 << PYEOF
-import json, re, sys
-
-try:
-    with open('$OUTFILE', 'r') as f:
-        content = f.read()
-    
-    # Fix 1: number/value followed by newline then null (missing comma)
-    content = re.sub(r'(\d+)\s*\n\s*null', r'\1', content)
-    # Fix 2: closing quote followed by newline then null
-    content = re.sub(r'(")\s*\n\s*null', r'\1', content)
-    # Fix 3: true/false followed by newline then null  
-    content = re.sub(r'(true|false)\s*\n\s*null', r'\1', content)
-    # Fix 4: dash used as null in SMART attributes
-    content = re.sub(r':\s*-\s*,', ': null,', content)
-    content = re.sub(r':\s*-\s*}', ': null}', content)
-    # Fix 5: leading zeros in numbers (000 → 0, 007 → 7)
-    content = re.sub(r':\s*0+([1-9])', r': \1', content)
-    content = re.sub(r':\s*0{2,}([,}\]])', r': 0\1', content)
-    # Fix 6: remove trailing commas before } or ]
-    content = re.sub(r',\s*}', '}', content)
-    content = re.sub(r',\s*]', ']', content)
-    
-    # Validate
-    data = json.loads(content)
-    
-    # Write clean JSON
-    with open('$OUTFILE', 'w') as f:
-        json.dump(data, f)
-    
-    print("JSON cleaned and validated OK")
-
-except json.JSONDecodeError as e:
-    print(f"JSON error after cleanup: {e}")
-    # Try more aggressive fix
-    try:
-        # Remove all problematic dash values
-        content = re.sub(r'"value":\s*-', '"value": null', content)
-        content = re.sub(r'"worst":\s*-', '"worst": null', content)
-        content = re.sub(r'"raw":\s*-', '"raw": null', content)
-        content = re.sub(r',\s*}', '}', content)
-        content = re.sub(r',\s*]', ']', content)
-        data = json.loads(content)
-        with open('$OUTFILE', 'w') as f:
-            json.dump(data, f)
-        print("JSON fixed with aggressive cleanup OK")
-    except Exception as e2:
-        print(f"JSON still invalid: {e2}")
-except Exception as e:
-    print(f"Error: {e}")
-PYEOF
-fi
-cp "$OUTFILE" "$TMPD/platine_live.json"    2>/dev/null || true
-cp "$OUTFILE" "/tmp/platine_map.json"       2>/dev/null || true
-
-# jq validation if available
-if cmd jq; then
-    jq empty "$OUTFILE" 2>/dev/null && log_ok "JSON valid ✓" || log_warn "JSON may have issues"
-fi
-
-# ── Auto-fix JSON if invalid ──────────────────────────────────
-if cmd python3; then
-    python3 -c "
-import json, re, sys
-try:
-    with open('$OUTFILE') as f:
-        content = f.read()
-    json.loads(content)
-except json.JSONDecodeError:
-    # Fix: number followed by newline and null without comma
-    content = re.sub(r'(\d+)\s*\nnull', r'\1', content)
-    # Fix: any value followed by newline without comma before next key
-    content = re.sub(r'(\d+)\s*\n\s*(null|true|false|\")', r'\1,\2', content)
-    with open('$OUTFILE', 'w') as f:
-        f.write(content)
-    # Verify fix worked
-    try:
-        json.loads(content)
-        print('JSON auto-fixed successfully')
-    except:
-        print('JSON still has issues after fix')
-" 2>/dev/null || true
-fi
-
-# ── Send to platine.dev ───────────────────────────────────────
-PLATINE_API="https://platine.dev/api/live/start"
-LIVE_LINK=""
-
-# Ensure DNS is set before connecting
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-
-log_info "Connecting to platine.dev..."
-
-if cmd curl; then
-    RESPONSE=$(curl -s -m 15 \
-        --dns-servers 8.8.8.8 \
-        -X POST "$PLATINE_API" \
-        -H "Content-Type: application/json" \
-        -d @"$OUTFILE" 2>/dev/null || echo "")
-elif cmd wget; then
-    RESPONSE=$(wget -q -O- --timeout=15 \
-        --post-file="$OUTFILE" \
-        --header="Content-Type: application/json" \
-        "$PLATINE_API" 2>/dev/null || echo "")
-fi
-
-# Extract live link from response (use grep -o for Alpine compatibility)
-if [ -n "$RESPONSE" ]; then
-    LIVE_LINK=$(echo "$RESPONSE" | grep -o '"live_url":"[^"]*"' | grep -o 'https://[^"]*' || echo "")
-fi
-
-# ── Final output ──────────────────────────────────────────────
-printf "\n"
-printf "  ${G}✓ Scan complete!${N}\n"
-printf "\n"
-
-if [ -n "$LIVE_LINK" ]; then
-    printf "  ${C}┌─────────────────────────────────────────────────────┐${N}\n"
-    printf "  ${C}│  Open on any device:                                │${N}\n"
-    printf "  ${C}│                                                     │${N}\n"
-    printf "  ${C}│  %-51s│${N}\n" "$LIVE_LINK"
-    printf "  ${C}│                                                     │${N}\n"
-    printf "  ${C}│  Link expires in 24h                                │${N}\n"
-    printf "  ${C}└─────────────────────────────────────────────────────┘${N}\n"
-    printf "\n"
-    # ── QR code ───────────────────────────────────────────────
-    if ! cmd qrencode; then
-        apk add --no-cache qrencode 2>/dev/null || true
-    fi
-    if cmd qrencode; then
-        printf "  ${W}Scan with your phone:${N}\n\n"
-        qrencode -t ANSIUTF8 -m 2 "$LIVE_LINK"
-        printf "\n"
-    fi
-else
-    # No internet — show local file path as fallback
-    printf "  ${Y}⚠ Could not connect to platine.dev${N}\n"
-    printf "  ${W}No internet connection detected.${N}\n"
-    printf "  ${W}Scan saved locally: %s${N}\n" "$OUTFILE"
-    printf "\n"
-    printf "  ${C}┌─────────────────────────────────────────────────────┐${N}\n"
-    printf "  ${C}│  Connect to WiFi and re-run platine-scan.sh         │${N}\n"
-    printf "  ${C}│  to get your live platine.dev link.                 │${N}\n"
-    printf "  ${C}└─────────────────────────────────────────────────────┘${N}\n"
-fi
-
-printf "\n"
-
-# ── Live refresh loop (sends updates every 5s) ────────────────
-if [ -n "$LIVE_LINK" ]; then
-    PLATINE_UPDATE="https://platine.dev/api/live/update"
-    SESSION_ID=$(echo "$RESPONSE" | grep -o '"session_id":"[^"]*"' | grep -o '[^"]*"$' | tr -d '"' || echo "")
-
-    if [ -n "$SESSION_ID" ]; then
-        log_info "Sending live updates every 5s... (Ctrl+C to stop)"
-        while true; do
-            sleep 5
-
-            # Quick thermal refresh
-            QT_JSON=""
-            for hwm in /sys/class/hwmon/hwmon*/; do
-                HQN=$(cat "${hwm}name" 2>/dev/null || echo "hw")
-                for qtf in "${hwm}"temp*_input; do
-                    [ -f "$qtf" ] || continue
-                    QTL=$(cat "${qtf/_input/_label}" 2>/dev/null || basename "$qtf" | sed 's/_input//')
-                    QTRAW=$(cat "$qtf" 2>/dev/null || echo "0")
-                    QTC=$(awk -v r="$QTRAW" 'BEGIN{printf "%.1f",r/1000}')
-                    [ -n "$QT_JSON" ] && QT_JSON="$QT_JSON,"
-                    _QT_KEY=$(jstr "$HQN/$QTL")
-                    QT_JSON="$QT_JSON\"${_QT_KEY}\":$QTC"
-                done
-            done
-
-            QLIVE_LOAD=$(top -bn1 2>/dev/null | grep "^%Cpu" | awk '{printf "%.1f",100-$8}' || echo "0")
-            QLIVE_RAM=$(awk '/MemAvailable/{printf "%.1f",$2/1048576}' /proc/meminfo || echo "0")
-            QLIVE_NOW=$(date '+%Y-%m-%d %H:%M:%S')
-
-            PATCH=$(printf '{"session_id":"%s","thermals":{%s},"cpu_load":%s,"ram_free_gb":%s,"updated_at":"%s"}' \
-                "$SESSION_ID" "$QT_JSON" "$QLIVE_LOAD" "$QLIVE_RAM" "$QLIVE_NOW")
-
-            if cmd curl; then
-                curl -s -m 5 --dns-servers 8.8.8.8 \
-                    -X POST "$PLATINE_UPDATE" \
-                    -H "Content-Type: application/json" \
-                    -d "$PATCH" >/dev/null 2>&1 || true
-            fi
-        done
-    fi
-fi
+main "$@"

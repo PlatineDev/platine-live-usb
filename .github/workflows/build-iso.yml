@@ -1,0 +1,39 @@
+name: Build Platine ISO
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y xorriso wget curl mtools
+
+      - name: Validate scripts (syntax check)
+        run: |
+          bash -n platine-scan.sh
+          bash -n build-iso.sh
+
+      - name: Build ISO
+        run: sudo bash build-iso.sh
+
+      - name: Verify ISO
+        run: |
+          ls -lh platine-live.iso
+          file platine-live.iso
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: platine-live-${{ github.sha }}
+          path: platine-live.iso
+          retention-days: 30
