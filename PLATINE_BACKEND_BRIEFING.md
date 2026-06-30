@@ -685,6 +685,210 @@ PUSHER_CLUSTER="..."
 
 ---
 
+## Branding — Logo Platine Obligatorio
+
+El logo de Platine 💎 debe aparecer en **todos** los siguientes lugares sin excepción:
+
+| Lugar | Forma |
+|---|---|
+| Página del scan (`/scan/:id`) | Header top-left, siempre visible |
+| PDF de certificación | Watermark + header prominente |
+| PDF del currículum | Header + footer en cada página |
+| Página de perfil del técnico | Junto al badge de verificación |
+| Emails automáticos | Header del email |
+| Terminal del scanner (boot) | ASCII art en la pantalla de inicio |
+| ISO boot splash | Logo en la pantalla de arranque |
+
+El logo en el scanner (terminal) ya está como texto — en el frontend debe ser SVG/PNG oficial.
+Nunca mostrar el reporte sin el logo. Es la marca que valida el diagnóstico.
+
+---
+
+## Currículum del Técnico
+
+### Schema adicional en Prisma
+
+```prisma
+model TechnicianProfile {
+  id              String     @id @default(cuid())
+  technician_id   String     @unique
+  technician      Technician @relation(fields: [technician_id], references: [id])
+
+  // Datos personales
+  full_name       String
+  title           String?        // ej: "Técnico en Reparación de Equipos de Cómputo"
+  phone           String?
+  email           String?
+  website         String?
+  location        String?        // ciudad, país
+  languages       String[]       // ["Español", "Inglés"]
+  avatar_url      String?
+
+  // Experiencia
+  years_experience Int?
+  work_history    Json           // [{company, role, from, to, description}]
+  education       Json           // [{institution, degree, year}]
+  certifications  Json           // [{name, issuer, year, url}]  ← aquí van certs de Platine
+  specialties     String[]       // ["MacBook", "laptops gaming", "impresoras"]
+
+  // Stats calculados automáticamente (no los pone el técnico)
+  total_repairs   Int    @default(0)
+  total_scans     Int    @default(0)   // cuántos scans ha hecho con el USB
+  total_votes     Int    @default(0)
+  total_views     Int    @default(0)
+  member_since    DateTime @default(now())
+
+  // Visibilidad
+  public          Boolean @default(true)
+  show_phone      Boolean @default(false)
+  show_email      Boolean @default(false)
+
+  updated_at      DateTime @updatedAt
+}
+
+model PlatineCertification {
+  id              String     @id @default(cuid())
+  technician_id   String
+  technician      Technician @relation(fields: [technician_id], references: [id])
+
+  cert_type       String     // "hardware_scanner" | "community_expert" | "verified_tech"
+  cert_number     String     @unique   // ej: "PLT-2026-00142"
+  issued_at       DateTime   @default(now())
+  expires_at      DateTime?
+  pdf_url         String?    // URL del PDF generado en R2
+  valid           Boolean    @default(true)
+
+  // Criterios que cumplió para obtenerla
+  scans_count     Int?       // cuántos scans tenía cuando se emitió
+  repairs_count   Int?
+  votes_count     Int?
+}
+```
+
+### Niveles de Certificación Platine 💎
+
+Los técnicos ganan certificaciones automáticamente al cumplir criterios:
+
+| Certificación | Nombre | Criterio |
+|---|---|---|
+| 💎 Platine Hardware Scanner | Técnico Certificado Platine | Hacer 1 scan exitoso con el USB |
+| 🔧 Platine Repair Contributor | Contribuidor de Reparaciones | Publicar 5+ reparaciones con votos positivos |
+| ⭐ Platine Expert | Técnico Experto Platine | 25+ reparaciones, 100+ votos, 1 año activo |
+| 🏆 Platine Master | Maestro Platine | 100+ reparaciones, top 5% de votos, verificado |
+
+Cada certificación genera un **PDF único** con número de serie verificable.
+
+### Endpoints de Currículum y Certificación
+
+```
+GET  /api/tech/:username/curriculum        → devuelve datos del perfil completo
+PUT  /api/tech/me/curriculum               → actualizar currículum propio
+GET  /api/tech/:username/curriculum/pdf    → descarga el PDF del currículum
+GET  /api/tech/:username/certifications    → lista de certificaciones
+POST /api/tech/me/certifications/generate  → genera/regenera PDF de certificación
+
+GET  /api/cert/verify/:cert_number         → página pública de verificación
+                                             (QR en el PDF apunta aquí)
+```
+
+### PDF del Currículum — Contenido
+
+Generado con `@react-pdf/renderer` o Puppeteer (renderizar una página Next.js a PDF).
+
+```
+┌─────────────────────────────────────────────────────┐
+│  💎 PLATINE                           platine.dev   │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  Juan Carlos Méndez                                 │
+│  Técnico en Reparación de Equipos de Cómputo        │
+│  📍 Guadalajara, México  |  🌐 juantech.com         │
+│                                                     │
+├─────────────────────────────────────────────────────┤
+│  ESPECIALIDADES                                     │
+│  MacBook · Laptops Gaming · Tablets · Impresoras    │
+│                                                     │
+│  EXPERIENCIA                              8 años    │
+│                                                     │
+│  TechRepair GDL            2021 – presente          │
+│  Técnico Senior                                     │
+│  Diagnóstico y reparación de equipos Apple y PC     │
+│                                                     │
+│  CompuServicio del Norte   2018 – 2021              │
+│  Técnico                                            │
+│                                                     │
+│  EDUCACIÓN                                          │
+│  CETIS 123 — Técnico en Informática, 2018           │
+│                                                     │
+├─────────────────────────────────────────────────────┤
+│  CERTIFICACIONES PLATINE                            │
+│                                                     │
+│  💎 Técnico Certificado Platine         2024        │
+│     N° PLT-2024-00042  ✓ Verificado                │
+│                                                     │
+│  ⭐ Técnico Experto Platine            2025         │
+│     N° PLT-2025-00009  ✓ Verificado                │
+│                                                     │
+├─────────────────────────────────────────────────────┤
+│  ESTADÍSTICAS PLATINE (verificadas)                 │
+│  147 reparaciones · 3,241 votos · 89,000 vistas     │
+│  312 scans realizados · Miembro desde Enero 2024    │
+│                                                     │
+├─────────────────────────────────────────────────────┤
+│  [QR: platine.dev/tech/juanmendez]                  │
+│  💎 platine.dev — Verificado el 30/06/2026          │
+└─────────────────────────────────────────────────────┘
+```
+
+### PDF de Certificación — Contenido
+
+```
+┌─────────────────────────────────────────────────────┐
+│                                                     │
+│              💎 PLATINE                             │
+│                                                     │
+│         CERTIFICADO DE EXCELENCIA TÉCNICA           │
+│                                                     │
+│  Este certificado acredita que                      │
+│                                                     │
+│         JUAN CARLOS MÉNDEZ TORRES                   │
+│                                                     │
+│  ha completado exitosamente los requisitos para     │
+│  obtener la distinción de                           │
+│                                                     │
+│       ⭐ TÉCNICO EXPERTO PLATINE                    │
+│                                                     │
+│  Demostrado mediante:                               │
+│  · 147 reparaciones documentadas en Platine.dev     │
+│  · 3,241 votos positivos de la comunidad            │
+│  · 1+ años de actividad continua                    │
+│                                                     │
+│  Emitido: 15 de Marzo, 2025                         │
+│  Número de certificado: PLT-2025-00009              │
+│                                                     │
+│  [QR de verificación]                               │
+│  Verificar en: platine.dev/cert/PLT-2025-00009      │
+│                                                     │
+│  ────────────────────────────────────────           │
+│  💎 Platine — platine.dev                           │
+│  Este documento es verificable en línea.            │
+└─────────────────────────────────────────────────────┘
+```
+
+### Página Pública de Verificación — `/cert/:cert_number`
+
+Cuando alguien escanea el QR del certificado ve:
+- ✅ / ❌ si el certificado es válido
+- Nombre del técnico
+- Tipo de certificación
+- Fecha de emisión
+- Stats en el momento de la emisión
+- Link al perfil del técnico
+
+Esto permite que un cliente o empleador verifique la cert con solo escanear el QR.
+
+---
+
 ## Lo que NO hace el Scanner (para no prometer de más)
 
 - No hace test de estrés de RAM (necesita memtest86 — no es posible en shell)
