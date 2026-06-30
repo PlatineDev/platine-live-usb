@@ -74,7 +74,7 @@ add_problem() {
 }
 
 # ── Module status tracking ────────────────────────────────────
-MODULES="cpu ram storage battery gpu network thermals audio usb os security"
+MODULES="cpu ram storage battery gpu network thermals audio usb os security android netspeed"
 st_set()  { printf '%s\n' "$2" > "$TMPD/status_$1"; }
 st_get()  { cat "$TMPD/status_$1" 2>/dev/null || printf 'pending'; }
 sum_set() { printf '%s\n' "$2" > "$TMPD/summary_$1"; }
@@ -174,6 +174,27 @@ scan_machine() {
     printf '%s'  "${CHASSIS:-}" > "$TMPD/machine_chassis"
     printf '%s · BIOS %s' "${VENDOR:-Unknown} ${MODEL:-}" "${BIOS_VER:-?}" > "$TMPD/machine_line"
 
+    # BIOS age warning
+    local BIOS_AGE_YEARS=""
+    if [ -n "${BIOS_DATE:-}" ]; then
+        local bios_year
+        bios_year=$(echo "$BIOS_DATE" | grep -oP '\b(19|20)[0-9]{2}\b' | head -1 || echo "")
+        if [ -n "${bios_year:-}" ]; then
+            BIOS_AGE_YEARS=$(( $(date +%Y) - bios_year ))
+            if [ "${BIOS_AGE_YEARS:-0}" -ge 5 ]; then
+                add_problem "warning" "machine" "BIOS is ${BIOS_AGE_YEARS} years old — security risk" \
+                    "BIOS ${BIOS_VER:-?} dated ${BIOS_DATE}" \
+                    "Update BIOS from manufacturer website for security patches." \
+                    "$TMPD/probs_machine.ndjson"
+            elif [ "${BIOS_AGE_YEARS:-0}" -ge 3 ]; then
+                add_problem "warning" "machine" "BIOS update recommended (${BIOS_AGE_YEARS} years old)" \
+                    "BIOS ${BIOS_VER:-?} dated ${BIOS_DATE}" \
+                    "Check manufacturer website for BIOS updates." \
+                    "$TMPD/probs_machine.ndjson"
+            fi
+        fi
+    fi
+
     cat > "$TMPD/json_machine.json" <<JSON
 {
   "manufacturer": $(jstr "${VENDOR:-}"),
@@ -182,7 +203,8 @@ scan_machine() {
   "uuid": $(jstr "${UUID:-}"),
   "chassis_type": $(jstr "${CHASSIS:-}"),
   "bios_version": $(jstr "${BIOS_VER:-}"),
-  "bios_date": $(jstr "${BIOS_DATE:-}")
+  "bios_date": $(jstr "${BIOS_DATE:-}"),
+  "bios_age_years": $(jnum "${BIOS_AGE_YEARS:-}")
 }
 JSON
 }
@@ -412,7 +434,7 @@ scan_storage() {
         local DTYPE SIZE_GB MODEL SERIAL SMART_HEALTH POWER_HOURS="" TEMP_C=""
         local REALLOCATED="0" PENDING="0" UNCORRECTABLE="0"
         local NVME_SPARE="" NVME_PCT_USED="" NVME_UNSAFE_SHUT="" NVME_POWER_CYCLES=""
-        local attrs_json=""
+        local attrs_json="" READ_SPEED_MBPS=""
 
         case "$dev" in
             /dev/nvme*)   DTYPE="NVMe" ;;
@@ -507,7 +529,14 @@ scan_storage() {
             fi
         fi
 
-        drives_json="${drives_json}{\"device\":$(jstr "$dev"),\"type\":$(jstr "${DTYPE:-}"),\"model\":$(jstr "${MODEL:-}"),\"serial\":$(jstr "${SERIAL:-}"),\"size_gb\":$(jnum "${SIZE_GB:-}"),\"smart_health\":$(jstr "${SMART_HEALTH:-}"),\"temp_c\":$(jnum "${TEMP_C:-}"),\"power_hours\":$(jnum "${POWER_HOURS:-}"),\"reallocated_sectors\":$(jnum "${REALLOCATED:-0}"),\"pending_sectors\":$(jnum "${PENDING:-0}"),\"uncorrectable\":$(jnum "${UNCORRECTABLE:-0}"),\"nvme_percentage_used\":$(jnum "${NVME_PCT_USED:-}"),\"nvme_available_spare\":$(jnum "${NVME_SPARE:-}"),\"nvme_unsafe_shutdowns\":$(jnum "${NVME_UNSAFE_SHUT:-}"),\"nvme_power_cycles\":$(jnum "${NVME_POWER_CYCLES:-}"),\"smart_attrs\":[${attrs_json%,}]},"
+        # Non-destructive sequential read speed (~5s, reads first 512MB)
+        if cmd dd; then
+            READ_SPEED_MBPS=$(dd if="$dev" of=/dev/null bs=4M count=128 2>&1 | \
+                grep -oP '[0-9.]+ [MG]B/s' | head -1 | \
+                awk '{if($2~/GB/) printf "%.0f",$1*1024; else printf "%.0f",$1}' 2>/dev/null || echo "")
+        fi
+
+        drives_json="${drives_json}{\"device\":$(jstr "$dev"),\"type\":$(jstr "${DTYPE:-}"),\"model\":$(jstr "${MODEL:-}"),\"serial\":$(jstr "${SERIAL:-}"),\"size_gb\":$(jnum "${SIZE_GB:-}"),\"read_speed_mbps\":$(jnum "${READ_SPEED_MBPS:-}"),\"smart_health\":$(jstr "${SMART_HEALTH:-}"),\"temp_c\":$(jnum "${TEMP_C:-}"),\"power_hours\":$(jnum "${POWER_HOURS:-}"),\"reallocated_sectors\":$(jnum "${REALLOCATED:-0}"),\"pending_sectors\":$(jnum "${PENDING:-0}"),\"uncorrectable\":$(jnum "${UNCORRECTABLE:-0}"),\"nvme_percentage_used\":$(jnum "${NVME_PCT_USED:-}"),\"nvme_available_spare\":$(jnum "${NVME_SPARE:-}"),\"nvme_unsafe_shutdowns\":$(jnum "${NVME_UNSAFE_SHUT:-}"),\"nvme_power_cycles\":$(jnum "${NVME_POWER_CYCLES:-}"),\"smart_attrs\":[${attrs_json%,}]},"
     done
 
     local summ="${drive_count} drive(s) found"
@@ -859,6 +888,196 @@ JSON
     st_set security done
 }
 
+# ── Scan: Android phone via ADB ──────────────────────────────
+scan_android() {
+    st_set android running
+    local pfile="$TMPD/probs_android.ndjson"
+
+    if ! cmd adb; then
+        sum_set android "adb not available"
+        printf 'null' > "$TMPD/json_android.json"
+        st_set android done
+        return
+    fi
+
+    adb start-server 2>/dev/null || true
+    sleep 1
+
+    local DEVICE_SERIAL
+    DEVICE_SERIAL=$(adb devices 2>/dev/null | grep -v "^List\|^$\|unauthorized\|offline" \
+        | awk 'NR==1{print $1}' || echo "")
+
+    if [ -z "${DEVICE_SERIAL:-}" ]; then
+        sum_set android "No device connected"
+        printf '{"detected":false}' > "$TMPD/json_android.json"
+        st_set android done
+        return
+    fi
+
+    local ADB_SH="adb -s ${DEVICE_SERIAL} shell"
+
+    local BRAND MODEL ANDROID_VER SECURITY_PATCH HARDWARE ARCH FINGERPRINT
+    BRAND=$(           $ADB_SH getprop ro.product.brand         2>/dev/null | tr -d '\r\n' || echo "")
+    MODEL=$(           $ADB_SH getprop ro.product.model         2>/dev/null | tr -d '\r\n' || echo "")
+    ANDROID_VER=$(     $ADB_SH getprop ro.build.version.release 2>/dev/null | tr -d '\r\n' || echo "")
+    SECURITY_PATCH=$(  $ADB_SH getprop ro.build.version.security_patch 2>/dev/null | tr -d '\r\n' || echo "")
+    HARDWARE=$(        $ADB_SH getprop ro.hardware              2>/dev/null | tr -d '\r\n' || echo "")
+    ARCH=$(            $ADB_SH getprop ro.product.cpu.abi       2>/dev/null | tr -d '\r\n' || echo "")
+
+    # Battery
+    local BAT_LEVEL="" BAT_HEALTH_CODE="" BAT_HEALTH_STR="" BAT_TEMP_C="" BAT_VOLTAGE_V=""
+    local bat_dump
+    bat_dump=$($ADB_SH dumpsys battery 2>/dev/null || echo "")
+    BAT_LEVEL=$(       echo "$bat_dump" | grep -oP '(?<=level: )[0-9]+'       | head -1 || echo "")
+    BAT_HEALTH_CODE=$( echo "$bat_dump" | grep -oP '(?<=health: )[0-9]+'      | head -1 || echo "")
+    local bat_temp_raw
+    bat_temp_raw=$(    echo "$bat_dump" | grep -oP '(?<=temperature: )[0-9]+' | head -1 || echo "")
+    [ -n "$bat_temp_raw" ] && BAT_TEMP_C=$(awk -v t="$bat_temp_raw" 'BEGIN{printf "%.1f",t/10}')
+    local bat_volt_raw
+    bat_volt_raw=$(    echo "$bat_dump" | grep -oP '(?<=voltage: )[0-9]+'     | head -1 || echo "")
+    [ -n "$bat_volt_raw" ] && BAT_VOLTAGE_V=$(awk -v v="$bat_volt_raw" 'BEGIN{printf "%.3f",v/1000}')
+
+    case "${BAT_HEALTH_CODE:-2}" in
+        2) BAT_HEALTH_STR="good" ;;
+        3) BAT_HEALTH_STR="overheat"
+           add_problem "critical" "android" "Phone battery overheating" \
+               "Android reports battery health: Overheat" "Replace battery." "$pfile" ;;
+        4) BAT_HEALTH_STR="dead"
+           add_problem "critical" "android" "Phone battery dead" \
+               "Android reports battery health: Dead" "Replace battery immediately." "$pfile" ;;
+        5) BAT_HEALTH_STR="overvoltage"
+           add_problem "warning" "android" "Phone battery overvoltage" \
+               "Android reports battery health: OverVoltage" \
+               "Check charger, replace battery." "$pfile" ;;
+        *) BAT_HEALTH_STR="unknown" ;;
+    esac
+
+    # Low battery warning
+    if [ -n "${BAT_LEVEL:-}" ] && [ "${BAT_LEVEL:-100}" -lt 20 ] 2>/dev/null; then
+        add_problem "warning" "android" "Phone battery critically low" \
+            "Battery level: ${BAT_LEVEL}%" "Charge device." "$pfile"
+    fi
+
+    # RAM
+    local PHONE_RAM_GB="" PHONE_RAM_AVAIL_GB=""
+    local mem_info
+    mem_info=$($ADB_SH cat /proc/meminfo 2>/dev/null || echo "")
+    PHONE_RAM_GB=$(    echo "$mem_info" | awk '/^MemTotal:/{printf "%.1f",$2/1048576}'    2>/dev/null || echo "")
+    PHONE_RAM_AVAIL_GB=$(echo "$mem_info" | awk '/^MemAvailable:/{printf "%.1f",$2/1048576}' 2>/dev/null || echo "")
+
+    # Internal storage (/data partition)
+    local PHONE_STORE_GB="" PHONE_STORE_AVAIL_GB=""
+    local df_line
+    df_line=$($ADB_SH df /data 2>/dev/null | tail -1 || echo "")
+    if [ -n "$df_line" ]; then
+        PHONE_STORE_GB=$(     echo "$df_line" | awk '{printf "%.1f",$2/1048576}' 2>/dev/null || echo "")
+        PHONE_STORE_AVAIL_GB=$(echo "$df_line" | awk '{printf "%.1f",$4/1048576}' 2>/dev/null || echo "")
+    fi
+
+    # Security patch age
+    if [ -n "${SECURITY_PATCH:-}" ]; then
+        local patch_year
+        patch_year=$(echo "$SECURITY_PATCH" | grep -oP '^\d{4}' || echo "")
+        if [ -n "${patch_year:-}" ]; then
+            local patch_age=$(( $(date +%Y) - patch_year ))
+            if [ "${patch_age:-0}" -ge 2 ]; then
+                add_problem "warning" "android" \
+                    "Android security patch outdated (${patch_age} years)" \
+                    "Last patch: ${SECURITY_PATCH}" \
+                    "Update Android or replace device." "$pfile"
+            fi
+        fi
+    fi
+
+    sum_set android "${BRAND:-?} ${MODEL:-?} · Android ${ANDROID_VER:-?} · Bat:${BAT_LEVEL:-?}%"
+
+    cat > "$TMPD/json_android.json" <<JSON
+{
+  "detected": true,
+  "device_serial": $(jstr "${DEVICE_SERIAL:-}"),
+  "brand": $(jstr "${BRAND:-}"),
+  "model": $(jstr "${MODEL:-}"),
+  "android_version": $(jstr "${ANDROID_VER:-}"),
+  "security_patch": $(jstr "${SECURITY_PATCH:-}"),
+  "hardware": $(jstr "${HARDWARE:-}"),
+  "cpu_abi": $(jstr "${ARCH:-}"),
+  "battery": {
+    "level_pct": $(jnum "${BAT_LEVEL:-}"),
+    "health": $(jstr "${BAT_HEALTH_STR:-unknown}"),
+    "temp_c": $(jnum "${BAT_TEMP_C:-}"),
+    "voltage_v": $(jnum "${BAT_VOLTAGE_V:-}")
+  },
+  "ram": {
+    "total_gb": $(jnum "${PHONE_RAM_GB:-}"),
+    "available_gb": $(jnum "${PHONE_RAM_AVAIL_GB:-}")
+  },
+  "storage": {
+    "total_gb": $(jnum "${PHONE_STORE_GB:-}"),
+    "available_gb": $(jnum "${PHONE_STORE_AVAIL_GB:-}")
+  }
+}
+JSON
+    st_set android done
+}
+
+# ── Scan: Network speed test ─────────────────────────────────
+scan_netspeed() {
+    st_set netspeed running
+    local DL_MBPS="" UL_MBPS="" LATENCY_MS="" PKT_LOSS=""
+
+    # Latency + packet loss
+    if cmd ping; then
+        local ping_out
+        ping_out=$(ping -c 5 -q 8.8.8.8 2>/dev/null || echo "")
+        LATENCY_MS=$(echo "$ping_out" | grep -oP 'rtt.*= [0-9.]+/\K[0-9.]+' | head -1 || echo "")
+        [ -z "$LATENCY_MS" ] && \
+            LATENCY_MS=$(echo "$ping_out" | grep -oP 'avg.*= [0-9.]+/\K[0-9.]+' | head -1 || echo "")
+        PKT_LOSS=$(echo "$ping_out" | grep -oP '[0-9]+(?=% packet loss)' | head -1 || echo "0")
+    fi
+
+    if cmd curl; then
+        # Download: 5 MB from Cloudflare
+        DL_MBPS=$(curl -o /dev/null -s -w '%{speed_download}' \
+            --connect-timeout 5 --max-time 20 \
+            'https://speed.cloudflare.com/__down?bytes=5000000' 2>/dev/null | \
+            awk '{printf "%.1f",$1/125000}' 2>/dev/null || echo "")
+
+        # Upload: 2 MB to Cloudflare
+        UL_MBPS=$(dd if=/dev/urandom bs=1M count=2 2>/dev/null | \
+            curl -o /dev/null -s -w '%{speed_upload}' \
+            --connect-timeout 5 --max-time 20 \
+            -X POST 'https://speed.cloudflare.com/__up' \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary @- 2>/dev/null | \
+            awk '{printf "%.1f",$1/125000}' 2>/dev/null || echo "")
+    fi
+
+    # Warn on high latency or packet loss
+    local pfile="$TMPD/probs_netspeed.ndjson"
+    if [ -n "${PKT_LOSS:-}" ] && [ "${PKT_LOSS:-0}" -gt 0 ] 2>/dev/null; then
+        add_problem "warning" "network" "Packet loss detected" \
+            "${PKT_LOSS}% packet loss to 8.8.8.8" \
+            "Check network cable, router, or ISP connection." "$pfile"
+    fi
+    if [ -n "${LATENCY_MS:-}" ] && awk -v l="${LATENCY_MS}" 'BEGIN{exit !(l+0>150)}' 2>/dev/null; then
+        add_problem "warning" "network" "High network latency" \
+            "Ping to 8.8.8.8: ${LATENCY_MS}ms (normal <50ms)" \
+            "Check connection quality. May indicate ISP issue." "$pfile"
+    fi
+
+    sum_set netspeed "↓${DL_MBPS:-?}Mbps ↑${UL_MBPS:-?}Mbps Ping:${LATENCY_MS:-?}ms"
+
+    cat > "$TMPD/json_netspeed.json" <<JSON
+{
+  "ping_ms": $(jnum "${LATENCY_MS:-}"),
+  "packet_loss_pct": $(jnum "${PKT_LOSS:-0}"),
+  "download_mbps": $(jnum "${DL_MBPS:-}"),
+  "upload_mbps": $(jnum "${UL_MBPS:-}")
+}
+JSON
+    st_set netspeed done
+}
+
 # ── Form factor derivation ────────────────────────────────────
 get_form_factor() {
     local chassis
@@ -916,19 +1135,21 @@ assemble_json() {
     ALL_PROBS="${ALL_PROBS%,}"
 
     local J_CPU J_RAM J_STORAGE J_BATTERY J_GPU J_NETWORK J_THERMALS
-    local J_AUDIO J_USB J_OS J_SECURITY J_MACHINE
-    J_CPU=$(cat "$TMPD/json_cpu.json"      2>/dev/null || echo 'null')
-    J_RAM=$(cat "$TMPD/json_ram.json"      2>/dev/null || echo 'null')
-    J_STORAGE=$(cat "$TMPD/json_storage.json"   2>/dev/null || echo 'null')
-    J_BATTERY=$(cat "$TMPD/json_battery.json"   2>/dev/null || echo 'null')
-    J_GPU=$(cat "$TMPD/json_gpu.json"      2>/dev/null || echo 'null')
-    J_NETWORK=$(cat "$TMPD/json_network.json"   2>/dev/null || echo 'null')
-    J_THERMALS=$(cat "$TMPD/json_thermals.json" 2>/dev/null || echo 'null')
-    J_AUDIO=$(cat "$TMPD/json_audio.json"  2>/dev/null || echo 'null')
-    J_USB=$(cat "$TMPD/json_usb.json"      2>/dev/null || echo 'null')
-    J_OS=$(cat "$TMPD/json_os.json"        2>/dev/null || echo 'null')
-    J_SECURITY=$(cat "$TMPD/json_security.json" 2>/dev/null || echo 'null')
-    J_MACHINE=$(cat "$TMPD/json_machine.json"   2>/dev/null || echo 'null')
+    local J_AUDIO J_USB J_OS J_SECURITY J_MACHINE J_ANDROID J_NETSPEED
+    J_CPU=$(cat "$TMPD/json_cpu.json"        2>/dev/null || echo 'null')
+    J_RAM=$(cat "$TMPD/json_ram.json"        2>/dev/null || echo 'null')
+    J_STORAGE=$(cat "$TMPD/json_storage.json"     2>/dev/null || echo 'null')
+    J_BATTERY=$(cat "$TMPD/json_battery.json"     2>/dev/null || echo 'null')
+    J_GPU=$(cat "$TMPD/json_gpu.json"        2>/dev/null || echo 'null')
+    J_NETWORK=$(cat "$TMPD/json_network.json"     2>/dev/null || echo 'null')
+    J_THERMALS=$(cat "$TMPD/json_thermals.json"   2>/dev/null || echo 'null')
+    J_AUDIO=$(cat "$TMPD/json_audio.json"    2>/dev/null || echo 'null')
+    J_USB=$(cat "$TMPD/json_usb.json"        2>/dev/null || echo 'null')
+    J_OS=$(cat "$TMPD/json_os.json"          2>/dev/null || echo 'null')
+    J_SECURITY=$(cat "$TMPD/json_security.json"   2>/dev/null || echo 'null')
+    J_MACHINE=$(cat "$TMPD/json_machine.json"     2>/dev/null || echo 'null')
+    J_ANDROID=$(cat "$TMPD/json_android.json"     2>/dev/null || echo 'null')
+    J_NETSPEED=$(cat "$TMPD/json_netspeed.json"   2>/dev/null || echo 'null')
 
     cat > "$OUTPUT_FILE" <<JSON
 {
@@ -954,6 +1175,8 @@ assemble_json() {
   "usb": $J_USB,
   "os": $J_OS,
   "security": $J_SECURITY,
+  "android": $J_ANDROID,
+  "netspeed": $J_NETSPEED,
   "problems": [${ALL_PROBS}]
 }
 JSON
@@ -1073,12 +1296,13 @@ main() {
     scan_usb      > "$TMPD/log_usb.txt"      2>&1 & USB_PID=$!
     scan_os       > "$TMPD/log_os.txt"       2>&1 & OS_PID=$!
     scan_security > "$TMPD/log_security.txt" 2>&1 & SEC_PID=$!
+    scan_android  > "$TMPD/log_android.txt"  2>&1 & AND_PID=$!
 
     while kill -0 $CPU_PID $RAM_PID $STO_PID $BAT_PID $GPU_PID $NET_PID $THE_PID 2>/dev/null; do
         render_ui; sleep 0.5
     done
     wait $CPU_PID $RAM_PID $STO_PID $BAT_PID $GPU_PID $NET_PID $THE_PID \
-         $AUD_PID $USB_PID $OS_PID $SEC_PID 2>/dev/null || true
+         $AUD_PID $USB_PID $OS_PID $SEC_PID $AND_PID 2>/dev/null || true
     render_ui
 
     assemble_json
@@ -1095,6 +1319,12 @@ main() {
     }
 
     if setup_network; then
+        # Network speed test now that we have internet
+        [ "$SILENT" = false ] && printf "  ${C}Testing network speed...${N}\n"
+        scan_netspeed > "$TMPD/log_netspeed.txt" 2>&1
+        # Merge netspeed into output JSON (re-assemble with netspeed data now available)
+        assemble_json
+
         if upload_scan; then
             local LIVE_URL; LIVE_URL=$(cat "$TMPD/live_url" 2>/dev/null || echo "")
             show_qr "$LIVE_URL"
@@ -1106,6 +1336,10 @@ main() {
     else
         [ "$SILENT" = false ] && \
             printf "${Y}  No internet — JSON saved locally: %s${N}\n" "$OUTPUT_FILE"
+        st_set netspeed error
+        sum_set netspeed "No internet"
+        printf '{"ping_ms":null,"packet_loss_pct":null,"download_mbps":null,"upload_mbps":null}' \
+            > "$TMPD/json_netspeed.json"
     fi
 }
 
