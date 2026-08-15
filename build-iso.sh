@@ -140,6 +140,7 @@ PKGS=(
     ["wireless-tools"]="main"
     ["qrencode"]="community"
     ["android-tools"]="community"
+    ["libimobiledevice"]="community"
 )
 
 # Download package index for precise APK filenames
@@ -213,7 +214,7 @@ fi
 echo "Installing from internet..."
 apk update 2>/dev/null
 apk add --no-cache bash curl dmidecode smartmontools pciutils usbutils lm-sensors hdparm grep \
-    ca-certificates nvme-cli iw wireless-tools qrencode android-tools 2>/dev/null
+    ca-certificates nvme-cli iw wireless-tools qrencode android-tools libimobiledevice 2>/dev/null
 INSTALLEOF
 chmod +x "$ISO_ROOT/platine/install-tools.sh"
 

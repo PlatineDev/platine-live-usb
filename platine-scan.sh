@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  PLATINE LIVE USB — Hardware Scanner v2.0.0
+#  PLATINE LIVE USB — Hardware Scanner v2.2.0
 #  github.com/platinedev/platine-live-usb
 #  platine.dev
 #
@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-PLATINE_VERSION="2.0.0"
+PLATINE_VERSION="2.2.0"
 SCANNED_AT=$(date '+%Y-%m-%dT%H:%M:%S')
 SCAN_START=$SECONDS
 SCAN_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' | cut -c1-8 | tr '[:lower:]' '[:upper:]' 2>/dev/null \
@@ -28,6 +28,28 @@ for arg in "$@"; do
         --output=*) OUTPUT_FILE="${arg#*=}" ;;
     esac
 done
+
+# ── Auto-update (si hay red disponible y el USB es escribible) ─
+auto_update() {
+    command -v curl >/dev/null 2>&1 || return 0
+    local SCRIPT_PATH; SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    [ -w "$SCRIPT_PATH" ] || return 0
+    local LATEST
+    LATEST=$(curl -sf --max-time 5 "${PLATINE_API%/live}/scanner/version" 2>/dev/null \
+             | grep -oP '"version":"\K[^"]+' || echo "")
+    [ -z "${LATEST:-}" ] && return 0
+    [ "$LATEST" = "$PLATINE_VERSION" ] && return 0
+    local NEW_SCRIPT
+    NEW_SCRIPT=$(curl -sf --max-time 30 "${PLATINE_API%/live}/scanner/download" 2>/dev/null || echo "")
+    [ -z "${NEW_SCRIPT:-}" ] && return 0
+    printf '%s\n' "$NEW_SCRIPT" > "${SCRIPT_PATH}.new"
+    chmod +x "${SCRIPT_PATH}.new"
+    mv "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
+    [ "$SILENT" = false ] && printf '\033[0;36m  ✓ Scanner actualizado a %s — reiniciando...\033[0m\n' "$LATEST"
+    exec "$SCRIPT_PATH" "$@"
+}
+# Solo intentar auto-update si hay conexión activa (comprobación rápida)
+ip route 2>/dev/null | grep -q default && auto_update "$@" || true
 
 # ── Temp dir ──────────────────────────────────────────────────
 TMPD=$(mktemp -d /tmp/platine_scan_XXXXXX)
@@ -74,7 +96,7 @@ add_problem() {
 }
 
 # ── Module status tracking ────────────────────────────────────
-MODULES="cpu ram storage battery gpu network thermals audio usb os security android netspeed"
+MODULES="cpu ram storage battery gpu network thermals audio usb os security android netspeed ios"
 st_set()  { printf '%s\n' "$2" > "$TMPD/status_$1"; }
 st_get()  { cat "$TMPD/status_$1" 2>/dev/null || printf 'pending'; }
 sum_set() { printf '%s\n' "$2" > "$TMPD/summary_$1"; }
@@ -269,12 +291,33 @@ scan_cpu() {
                                      awk '{printf "%.1f",$1/1000}' 2>/dev/null || echo "")
     PER_CORE_TEMPS="${PER_CORE_TEMPS%,}"
 
-    # Throttle detection
+    # Throttle detection — thermal + power limit (RAPL)
     local THROTTLE_ACTIVE="false" THROTTLE_REASON="" THROTTLE_COUNT="0"
+    local RAPL_LIMIT_W="" RAPL_POWER_LIMIT_ACTIVE="false"
+
     THROTTLE_COUNT=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count 2>/dev/null || echo "0")
     if [ "${THROTTLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
         THROTTLE_ACTIVE="true"; THROTTLE_REASON="thermal"
     fi
+
+    # Intel RAPL — detectar power limit activo
+    for rapl_zone in /sys/class/powercap/intel-rapl/intel-rapl:0 \
+                     /sys/class/powercap/intel-rapl:0; do
+        [ -f "${rapl_zone}/constraint_0_power_limit_uw" ] || continue
+        RAPL_LIMIT_W=$(awk '{printf "%.1f",$1/1000000}' \
+            "${rapl_zone}/constraint_0_power_limit_uw" 2>/dev/null || echo "")
+        # Si el power limit es muy bajo comparado con el TDP nominal → throttle por power
+        local TDP_EST
+        TDP_EST=$(awk -v c="${CPU_CORES:-4}" 'BEGIN{printf "%.0f", c * 4.5}' 2>/dev/null || echo "0")
+        if [ -n "${RAPL_LIMIT_W:-}" ] && [ -n "${TDP_EST:-}" ]; then
+            if awk -v l="${RAPL_LIMIT_W}" -v t="${TDP_EST}" 'BEGIN{exit !(l+0 < t*0.7)}' 2>/dev/null; then
+                RAPL_POWER_LIMIT_ACTIVE="true"
+            fi
+        fi
+        break
+    done
+
+    # Heurística de frecuencia: si corre <60% del boost y temp no está alta → power limit
     if [ -n "${CPU_CUR_MHZ:-}" ] && [ -n "${CPU_MAX_MHZ:-}" ] && [ "${CPU_MAX_MHZ:-0}" -gt 0 ] 2>/dev/null; then
         local ratio
         ratio=$(awk -v c="${CPU_CUR_MHZ}" -v m="${CPU_MAX_MHZ}" \
@@ -283,6 +326,8 @@ scan_cpu() {
             THROTTLE_ACTIVE="true"
             if [ -n "${CPU_TEMP:-}" ] && awk -v t="${CPU_TEMP}" 'BEGIN{exit !(t+0>85)}' 2>/dev/null; then
                 THROTTLE_REASON="thermal"
+            elif [ "$RAPL_POWER_LIMIT_ACTIVE" = "true" ]; then
+                THROTTLE_REASON="power_limit_rapl"
             else
                 THROTTLE_REASON="${THROTTLE_REASON:-power_limit}"
             fi
@@ -325,6 +370,7 @@ scan_cpu() {
   "throttle_active": $(jbool "$THROTTLE_ACTIVE"),
   "throttle_reason": $(jstr "${THROTTLE_REASON:-}"),
   "throttle_count": $(jnum "${THROTTLE_COUNT:-0}"),
+  "rapl_limit_w": $(jnum "${RAPL_LIMIT_W:-}"),
   "cache": {
     "l1d": $(jstr "${CPU_L1D:-}"),
     "l1i": $(jstr "${CPU_L1I:-}"),
@@ -529,14 +575,63 @@ scan_storage() {
             fi
         fi
 
-        # Non-destructive sequential read speed (~5s, reads first 512MB)
+        # Lectura secuencial no destructiva (~5s, primeros 512MB)
         if cmd dd; then
             READ_SPEED_MBPS=$(dd if="$dev" of=/dev/null bs=4M count=128 2>&1 | \
                 grep -oP '[0-9.]+ [MG]B/s' | head -1 | \
                 awk '{if($2~/GB/) printf "%.0f",$1*1024; else printf "%.0f",$1}' 2>/dev/null || echo "")
         fi
 
-        drives_json="${drives_json}{\"device\":$(jstr "$dev"),\"type\":$(jstr "${DTYPE:-}"),\"model\":$(jstr "${MODEL:-}"),\"serial\":$(jstr "${SERIAL:-}"),\"size_gb\":$(jnum "${SIZE_GB:-}"),\"read_speed_mbps\":$(jnum "${READ_SPEED_MBPS:-}"),\"smart_health\":$(jstr "${SMART_HEALTH:-}"),\"temp_c\":$(jnum "${TEMP_C:-}"),\"power_hours\":$(jnum "${POWER_HOURS:-}"),\"reallocated_sectors\":$(jnum "${REALLOCATED:-0}"),\"pending_sectors\":$(jnum "${PENDING:-0}"),\"uncorrectable\":$(jnum "${UNCORRECTABLE:-0}"),\"nvme_percentage_used\":$(jnum "${NVME_PCT_USED:-}"),\"nvme_available_spare\":$(jnum "${NVME_SPARE:-}"),\"nvme_unsafe_shutdowns\":$(jnum "${NVME_UNSAFE_SHUT:-}"),\"nvme_power_cycles\":$(jnum "${NVME_POWER_CYCLES:-}"),\"smart_attrs\":[${attrs_json%,}]},"
+        # Escritura secuencial — en la primera partición montada con escritura
+        local WRITE_SPEED_MBPS=""
+        if cmd dd; then
+            local wpart wmp
+            for wpart in "${dev}"1 "${dev}"p1 "${dev}"; do
+                [ -b "$wpart" ] || continue
+                wmp=$(awk -v p="$wpart" '$1==p{print $2}' /proc/mounts 2>/dev/null | head -1 || echo "")
+                [ -z "$wmp" ] && continue
+                [ -w "$wmp" ] || continue
+                local wfile="${wmp}/.platine_wtest_$$"
+                WRITE_SPEED_MBPS=$(dd if=/dev/zero of="$wfile" bs=4M count=128 \
+                    conv=fdatasync 2>&1 | \
+                    grep -oP '[0-9.]+ [MG]B/s' | head -1 | \
+                    awk '{if($2~/GB/) printf "%.0f",$1*1024; else printf "%.0f",$1}' 2>/dev/null || echo "")
+                rm -f "$wfile" 2>/dev/null || true
+                break
+            done
+        fi
+
+        # Estimación de vida útil restante
+        local LIFE_PCT="" LIFE_LABEL=""
+        if [ "$DTYPE" = "NVMe" ] && [ -n "${NVME_PCT_USED:-}" ]; then
+            LIFE_PCT=$(( 100 - ${NVME_PCT_USED:-0} ))
+            if   [ "$LIFE_PCT" -ge 80 ]; then LIFE_LABEL="excellent"
+            elif [ "$LIFE_PCT" -ge 50 ]; then LIFE_LABEL="good"
+            elif [ "$LIFE_PCT" -ge 20 ]; then LIFE_LABEL="fair"
+            else LIFE_LABEL="critical"; fi
+        elif [ "$DTYPE" = "SSD" ] && [ -n "${POWER_HOURS:-}" ]; then
+            # SSD típico: ~10,000h de uso continuo → 40,000h totales encendido
+            LIFE_PCT=$(awk -v h="${POWER_HOURS}" 'BEGIN{v=100-h*100/40000; if(v<0)v=0; printf "%.0f",v}' 2>/dev/null || echo "")
+            [ -n "$LIFE_PCT" ] && {
+                if   [ "$LIFE_PCT" -ge 80 ]; then LIFE_LABEL="excellent"
+                elif [ "$LIFE_PCT" -ge 50 ]; then LIFE_LABEL="good"
+                elif [ "$LIFE_PCT" -ge 20 ]; then LIFE_LABEL="fair"
+                else LIFE_LABEL="critical"; fi
+            }
+        elif [ "$DTYPE" = "HDD" ] && [ -n "${POWER_HOURS:-}" ]; then
+            # HDD típico: ~50,000h
+            LIFE_PCT=$(awk -v h="${POWER_HOURS}" 'BEGIN{v=100-h*100/50000; if(v<0)v=0; printf "%.0f",v}' 2>/dev/null || echo "")
+            [ -n "$LIFE_PCT" ] && {
+                if   [ "$LIFE_PCT" -ge 80 ]; then LIFE_LABEL="excellent"
+                elif [ "$LIFE_PCT" -ge 50 ]; then LIFE_LABEL="good"
+                elif [ "$LIFE_PCT" -ge 20 ]; then LIFE_LABEL="fair"
+                else LIFE_LABEL="critical"; fi
+            }
+            # Reallocated sectors anulan la estimación — disco falla pronto
+            [ "${REALLOCATED:-0}" -ge 1 ] 2>/dev/null && { LIFE_PCT="0"; LIFE_LABEL="critical"; }
+        fi
+
+        drives_json="${drives_json}{\"device\":$(jstr "$dev"),\"type\":$(jstr "${DTYPE:-}"),\"model\":$(jstr "${MODEL:-}"),\"serial\":$(jstr "${SERIAL:-}"),\"size_gb\":$(jnum "${SIZE_GB:-}"),\"read_speed_mbps\":$(jnum "${READ_SPEED_MBPS:-}"),\"write_speed_mbps\":$(jnum "${WRITE_SPEED_MBPS:-}"),\"life_remaining_pct\":$(jnum "${LIFE_PCT:-}"),\"life_label\":$(jstr "${LIFE_LABEL:-}"),\"smart_health\":$(jstr "${SMART_HEALTH:-}"),\"temp_c\":$(jnum "${TEMP_C:-}"),\"power_hours\":$(jnum "${POWER_HOURS:-}"),\"reallocated_sectors\":$(jnum "${REALLOCATED:-0}"),\"pending_sectors\":$(jnum "${PENDING:-0}"),\"uncorrectable\":$(jnum "${UNCORRECTABLE:-0}"),\"nvme_percentage_used\":$(jnum "${NVME_PCT_USED:-}"),\"nvme_available_spare\":$(jnum "${NVME_SPARE:-}"),\"nvme_unsafe_shutdowns\":$(jnum "${NVME_UNSAFE_SHUT:-}"),\"nvme_power_cycles\":$(jnum "${NVME_POWER_CYCLES:-}"),\"smart_attrs\":[${attrs_json%,}]},"
     done
 
     local summ="${drive_count} drive(s) found"
@@ -607,7 +702,18 @@ scan_battery() {
 
         last_health="${BHEALTH:-}"; last_cap="${BCAP:-}"; last_swelling="$BSWELLING"
 
-        bats_json="${bats_json}{\"name\":$(jstr "${BNAME:-}"),\"status\":$(jstr "${BSTATUS:-}"),\"technology\":$(jstr "${BTECH:-}"),\"manufacturer\":$(jstr "${BMFR:-}"),\"charge_pct\":$(jnum "${BCAP:-}"),\"health_pct\":$(jnum "${BHEALTH:-}"),\"design_mwh\":$(jnum "${BDESIGN:-}"),\"full_mwh\":$(jnum "${BFULL:-}"),\"voltage_v\":$(jnum "${BVOLT:-}"),\"cycle_count\":$(jnum "${BCYCLES:-}"),\"swelling_risk\":$(jbool "${BSWELLING}")},"
+        # Estimación de vida útil restante
+        local BLIFE_PCT="" BLIFE_LABEL=""
+        if [ -n "${BHEALTH:-}" ]; then
+            BLIFE_PCT="$BHEALTH"
+            if   [ "${BHEALTH:-0}" -ge 80 ]; then BLIFE_LABEL="excellent"
+            elif [ "${BHEALTH:-0}" -ge 60 ]; then BLIFE_LABEL="good"
+            elif [ "${BHEALTH:-0}" -ge 40 ]; then BLIFE_LABEL="fair"
+            else BLIFE_LABEL="critical"; fi
+            [ "$BSWELLING" = "true" ] && BLIFE_LABEL="critical"
+        fi
+
+        bats_json="${bats_json}{\"name\":$(jstr "${BNAME:-}"),\"status\":$(jstr "${BSTATUS:-}"),\"technology\":$(jstr "${BTECH:-}"),\"manufacturer\":$(jstr "${BMFR:-}"),\"charge_pct\":$(jnum "${BCAP:-}"),\"health_pct\":$(jnum "${BHEALTH:-}"),\"life_remaining_pct\":$(jnum "${BLIFE_PCT:-}"),\"life_label\":$(jstr "${BLIFE_LABEL:-}"),\"design_mwh\":$(jnum "${BDESIGN:-}"),\"full_mwh\":$(jnum "${BFULL:-}"),\"voltage_v\":$(jnum "${BVOLT:-}"),\"cycle_count\":$(jnum "${BCYCLES:-}"),\"swelling_risk\":$(jbool "${BSWELLING}")},"
     done
 
     local summ
@@ -630,9 +736,16 @@ scan_gpu() {
     st_set gpu running
     local gpus_json="" gpu_count=0
 
+    # nvidia-smi data (disponible si el driver propietario está cargado)
+    local NVIDIA_SMI_OUT=""
+    cmd nvidia-smi && \
+        NVIDIA_SMI_OUT=$(nvidia-smi \
+            --query-gpu=index,name,temperature.gpu,memory.total,memory.used,power.draw,driver_version \
+            --format=csv,noheader,nounits 2>/dev/null || echo "")
+
     if cmd lspci; then
         while IFS= read -r line; do
-            local GSLOT GMODEL GDRIVER="" GREVISION="" GFW="" GVRAM="" GTEMP=""
+            local GSLOT GMODEL GDRIVER="" GREVISION="" GFW="" GVRAM="" GVRAM_USED="" GTEMP="" GPOWER_W=""
             GSLOT=$(echo "$line" | awk '{print $1}')
             GMODEL=$(echo "$line" | cut -d: -f3- | xargs 2>/dev/null || echo "Unknown GPU")
             gpu_count=$((gpu_count + 1))
@@ -647,17 +760,32 @@ scan_gpu() {
             local vram_file="/sys/class/drm/card${gidx}/device/mem_info_vram_total"
             [ -f "$vram_file" ] && GVRAM=$(awk '{printf "%.0f",$1/1024/1024}' "$vram_file" 2>/dev/null || echo "")
 
-            local hwmon hname
-            for hwmon in /sys/class/hwmon/hwmon*/; do
-                [ -d "$hwmon" ] || continue
-                hname=$(cat "${hwmon}name" 2>/dev/null || echo "")
-                echo "$hname" | grep -qiE "amdgpu|radeon|nouveau|nvidia" || continue
-                local tf="${hwmon}temp1_input"
-                [ -f "$tf" ] && GTEMP=$(awk '{printf "%.0f",$1/1000}' "$tf" 2>/dev/null || echo "")
-                break
-            done
+            # nvidia-smi override (más preciso para Nvidia)
+            if [ -n "${NVIDIA_SMI_OUT:-}" ] && echo "$GMODEL" | grep -qiE "nvidia|geforce|quadro|tesla"; then
+                local nv_row
+                nv_row=$(echo "$NVIDIA_SMI_OUT" | awk -v idx="$gidx" -F',' 'NR==idx+1{print}' | head -1)
+                if [ -n "${nv_row:-}" ]; then
+                    GTEMP=$(echo "$nv_row"     | awk -F',' '{gsub(/ /,"",$3); print $3}' || echo "")
+                    GVRAM=$(echo "$nv_row"     | awk -F',' '{gsub(/ /,"",$4); print $4}' || echo "")
+                    GVRAM_USED=$(echo "$nv_row"| awk -F',' '{gsub(/ /,"",$5); print $5}' || echo "")
+                    GPOWER_W=$(echo "$nv_row"  | awk -F',' '{gsub(/ /,"",$6); print $6}' || echo "")
+                fi
+            fi
 
-            gpus_json="${gpus_json}{\"slot\":$(jstr "${GSLOT:-}"),\"model\":$(jstr "${GMODEL:-}"),\"driver\":$(jstr "${GDRIVER:-}"),\"revision\":$(jstr "${GREVISION:-}"),\"firmware\":$(jstr "${GFW:-}"),\"vram_mb\":$(jnum "${GVRAM:-}"),\"temp_c\":$(jnum "${GTEMP:-}")},"
+            # hwmon fallback para temp (AMD/Intel)
+            if [ -z "${GTEMP:-}" ]; then
+                local hwmon hname
+                for hwmon in /sys/class/hwmon/hwmon*/; do
+                    [ -d "$hwmon" ] || continue
+                    hname=$(cat "${hwmon}name" 2>/dev/null || echo "")
+                    echo "$hname" | grep -qiE "amdgpu|radeon|nouveau|nvidia" || continue
+                    local tf="${hwmon}temp1_input"
+                    [ -f "$tf" ] && GTEMP=$(awk '{printf "%.0f",$1/1000}' "$tf" 2>/dev/null || echo "")
+                    break
+                done
+            fi
+
+            gpus_json="${gpus_json}{\"slot\":$(jstr "${GSLOT:-}"),\"model\":$(jstr "${GMODEL:-}"),\"driver\":$(jstr "${GDRIVER:-}"),\"revision\":$(jstr "${GREVISION:-}"),\"firmware\":$(jstr "${GFW:-}"),\"vram_mb\":$(jnum "${GVRAM:-}"),\"vram_used_mb\":$(jnum "${GVRAM_USED:-}"),\"temp_c\":$(jnum "${GTEMP:-}"),\"power_w\":$(jnum "${GPOWER_W:-}")},"
         done < <(lspci 2>/dev/null | grep -iE 'VGA compatible|3D controller|Display controller' || true)
     fi
 
@@ -886,6 +1014,109 @@ scan_security() {
 }
 JSON
     st_set security done
+}
+
+# ── Scan: iOS device via libimobiledevice ────────────────────
+scan_ios() {
+    st_set ios running
+    local pfile="$TMPD/probs_ios.ndjson"
+
+    if ! cmd idevice_id; then
+        sum_set ios "libimobiledevice not available"
+        printf 'null' > "$TMPD/json_ios.json"
+        st_set ios done
+        return
+    fi
+
+    # Intentar emparejar si no está (requiere que el usuario confíe en el PC en el iPhone)
+    idevicepair pair 2>/dev/null || true
+    sleep 1
+
+    local UDID
+    UDID=$(idevice_id -l 2>/dev/null | head -1 | tr -d '\r\n' || echo "")
+
+    if [ -z "${UDID:-}" ]; then
+        sum_set ios "No iOS device"
+        printf '{"detected":false}' > "$TMPD/json_ios.json"
+        st_set ios done
+        return
+    fi
+
+    local INFO_OUT
+    INFO_OUT=$(ideviceinfo -u "$UDID" 2>/dev/null || echo "")
+
+    get_prop() { echo "$INFO_OUT" | grep "^${1}:" | cut -d: -f2- | xargs 2>/dev/null || echo ""; }
+
+    local INAME IMODEL IOS_VER BUILD SERIAL IMEI STORAGE_TOTAL STORAGE_FREE
+    INAME=$(        get_prop "DeviceName")
+    IMODEL=$(       get_prop "ProductType")       # ej: iPhone15,3
+    IOS_VER=$(      get_prop "ProductVersion")    # ej: 17.4.1
+    BUILD=$(        get_prop "BuildVersion")
+    SERIAL=$(       get_prop "SerialNumber")
+    IMEI=$(         get_prop "InternationalMobileEquipmentIdentity")
+    STORAGE_TOTAL=$(get_prop "TotalDiskCapacity"  | awk '{printf "%.1f",$1/1024/1024/1024}' 2>/dev/null || echo "")
+    STORAGE_FREE=$( get_prop "TotalDataAvailable" | awk '{printf "%.1f",$1/1024/1024/1024}' 2>/dev/null || echo "")
+
+    # Batería via diagnostics
+    local BAT_INFO BAT_LEVEL="" BAT_HEALTH="" BAT_CYCLES="" BAT_DESIGN_CAP="" BAT_FULL_CAP=""
+    BAT_INFO=$(idevicediagnostics ioreg --class IOPMPowerSource 2>/dev/null | \
+               grep -E 'ExternalCharge|CurrentCapacity|DesignCapacity|CycleCount|BatteryHealth' || echo "")
+    BAT_LEVEL=$(  echo "$BAT_INFO" | grep -i 'CurrentCapacity' | grep -oP '[0-9]+' | head -1 || echo "")
+    BAT_CYCLES=$( echo "$BAT_INFO" | grep -i 'CycleCount'      | grep -oP '[0-9]+' | head -1 || echo "")
+    BAT_DESIGN_CAP=$(echo "$BAT_INFO" | grep -i 'DesignCapacity' | grep -oP '[0-9]+' | head -1 || echo "")
+    BAT_FULL_CAP=$(  echo "$BAT_INFO" | grep -i 'MaxCapacity'    | grep -oP '[0-9]+' | head -1 || echo "")
+
+    local BAT_HEALTH_PCT=""
+    if [ -n "${BAT_FULL_CAP:-}" ] && [ -n "${BAT_DESIGN_CAP:-}" ] && [ "${BAT_DESIGN_CAP:-0}" -gt 0 ] 2>/dev/null; then
+        BAT_HEALTH_PCT=$(awk -v f="${BAT_FULL_CAP}" -v d="${BAT_DESIGN_CAP}" \
+            'BEGIN{printf "%.0f",f*100/d}' 2>/dev/null || echo "")
+    fi
+
+    # iOS version age warning (>3 versiones principales atrás = inseguro)
+    if [ -n "${IOS_VER:-}" ]; then
+        local ios_major
+        ios_major=$(echo "$IOS_VER" | cut -d. -f1)
+        local current_ios=18  # actualizar según año
+        if [ -n "$ios_major" ] && [ $(( current_ios - ios_major )) -ge 2 ] 2>/dev/null; then
+            add_problem "warning" "ios" "iOS version very outdated" \
+                "Running iOS ${IOS_VER} (current: ~${current_ios}.x)" \
+                "Update iOS for security patches and app compatibility." "$pfile"
+        fi
+    fi
+
+    # Battery health warning
+    if [ -n "${BAT_HEALTH_PCT:-}" ] && [ "${BAT_HEALTH_PCT:-100}" -lt 80 ] 2>/dev/null; then
+        add_problem "warning" "ios" "iPhone battery health below Apple threshold" \
+            "Battery health: ${BAT_HEALTH_PCT}% (Apple recommends replacement at <80%)" \
+            "Replace battery at an Apple authorized service provider." "$pfile"
+    fi
+
+    sum_set ios "${INAME:-iPhone} · iOS ${IOS_VER:-?} · Bat:${BAT_LEVEL:-?}%"
+
+    cat > "$TMPD/json_ios.json" <<JSON
+{
+  "detected": true,
+  "udid": $(jstr "${UDID:-}"),
+  "name": $(jstr "${INAME:-}"),
+  "model": $(jstr "${IMODEL:-}"),
+  "ios_version": $(jstr "${IOS_VER:-}"),
+  "build_version": $(jstr "${BUILD:-}"),
+  "serial": $(jstr "${SERIAL:-}"),
+  "imei": $(jstr "${IMEI:-}"),
+  "battery": {
+    "level_pct": $(jnum "${BAT_LEVEL:-}"),
+    "health_pct": $(jnum "${BAT_HEALTH_PCT:-}"),
+    "cycle_count": $(jnum "${BAT_CYCLES:-}"),
+    "design_cap_mah": $(jnum "${BAT_DESIGN_CAP:-}"),
+    "full_cap_mah": $(jnum "${BAT_FULL_CAP:-}")
+  },
+  "storage": {
+    "total_gb": $(jnum "${STORAGE_TOTAL:-}"),
+    "available_gb": $(jnum "${STORAGE_FREE:-}")
+  }
+}
+JSON
+    st_set ios done
 }
 
 # ── Scan: Android phone via ADB ──────────────────────────────
@@ -1135,7 +1366,7 @@ assemble_json() {
     ALL_PROBS="${ALL_PROBS%,}"
 
     local J_CPU J_RAM J_STORAGE J_BATTERY J_GPU J_NETWORK J_THERMALS
-    local J_AUDIO J_USB J_OS J_SECURITY J_MACHINE J_ANDROID J_NETSPEED
+    local J_AUDIO J_USB J_OS J_SECURITY J_MACHINE J_ANDROID J_NETSPEED J_IOS
     J_CPU=$(cat "$TMPD/json_cpu.json"        2>/dev/null || echo 'null')
     J_RAM=$(cat "$TMPD/json_ram.json"        2>/dev/null || echo 'null')
     J_STORAGE=$(cat "$TMPD/json_storage.json"     2>/dev/null || echo 'null')
@@ -1149,6 +1380,7 @@ assemble_json() {
     J_SECURITY=$(cat "$TMPD/json_security.json"   2>/dev/null || echo 'null')
     J_MACHINE=$(cat "$TMPD/json_machine.json"     2>/dev/null || echo 'null')
     J_ANDROID=$(cat "$TMPD/json_android.json"     2>/dev/null || echo 'null')
+    J_IOS=$(cat "$TMPD/json_ios.json"             2>/dev/null || echo 'null')
     J_NETSPEED=$(cat "$TMPD/json_netspeed.json"   2>/dev/null || echo 'null')
 
     cat > "$OUTPUT_FILE" <<JSON
@@ -1176,6 +1408,7 @@ assemble_json() {
   "os": $J_OS,
   "security": $J_SECURITY,
   "android": $J_ANDROID,
+  "ios": $J_IOS,
   "netspeed": $J_NETSPEED,
   "problems": [${ALL_PROBS}]
 }
@@ -1297,12 +1530,13 @@ main() {
     scan_os       > "$TMPD/log_os.txt"       2>&1 & OS_PID=$!
     scan_security > "$TMPD/log_security.txt" 2>&1 & SEC_PID=$!
     scan_android  > "$TMPD/log_android.txt"  2>&1 & AND_PID=$!
+    scan_ios      > "$TMPD/log_ios.txt"      2>&1 & IOS_PID=$!
 
     while kill -0 $CPU_PID $RAM_PID $STO_PID $BAT_PID $GPU_PID $NET_PID $THE_PID 2>/dev/null; do
         render_ui; sleep 0.5
     done
     wait $CPU_PID $RAM_PID $STO_PID $BAT_PID $GPU_PID $NET_PID $THE_PID \
-         $AUD_PID $USB_PID $OS_PID $SEC_PID $AND_PID 2>/dev/null || true
+         $AUD_PID $USB_PID $OS_PID $SEC_PID $AND_PID $IOS_PID 2>/dev/null || true
     render_ui
 
     assemble_json
